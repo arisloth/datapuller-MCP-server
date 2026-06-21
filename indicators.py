@@ -5,6 +5,15 @@ Each function returns plain numbers or dicts that formatting.py renders to text.
 
 FIB_LEVELS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
 
+# --- Stage 1 regime / interpretation thresholds ---------------------------
+# Crude, asset- and timeframe-specific defaults (see Plan.md "Regime calibration").
+# Tune per instrument; majors and alts behave very differently.
+ADX_TREND = 25.0   # ADX >= this => trending regime (DI direction is actionable)
+ADX_RANGE = 20.0   # ADX <  this => ranging regime; ADX in [20, 25) is transitional
+LS_EXTREME_LONG  = 3.0   # global account L/S >= this => overcrowded longs  (contrarian bearish)
+LS_EXTREME_SHORT = 0.7   # global account L/S <= this => overcrowded shorts (contrarian bullish)
+OI_FLAT_PCT = 0.1        # |change| below this (either axis) => treated as flat in the OI quadrant
+
 
 def calc_obv(candles):
     obv = 0.0
@@ -264,4 +273,131 @@ def calc_fibs(candles) -> dict | None:
         "current_close": current_close,
         "levels": levels,
         "closest_index": closest_index,
+    }
+
+
+# --- Stage 1 interpretation layer -----------------------------------------
+# These functions add no new data; they reinterpret values the stack already
+# computes (ADX/DI, 200-EMA, OI change, L/S ratio, ATR) per Plan.md Stage 1.
+
+
+def classify_regime(adx, plus_di, minus_di, close, ema_200) -> dict:
+    """The meta-filter: classify the environment so the caller knows which
+    playbook applies (trend-following vs mean-reversion vs stand-aside).
+
+    Combines ADX strength with price position vs the 200-EMA. DI direction is
+    only treated as actionable in a trending regime — below ADX_TREND it whipsaws.
+    `ema_200` may be None (too few candles); regime then degrades to ADX + DI only.
+    """
+    if adx >= ADX_TREND:
+        adx_state = "trending"
+    elif adx >= ADX_RANGE:
+        adx_state = "developing"
+    else:
+        adx_state = "ranging"
+
+    above_200 = None if ema_200 is None else close > ema_200
+    di_direction = None
+    if adx >= ADX_TREND:
+        di_direction = "bullish" if plus_di > minus_di else "bearish"
+
+    # Default: not enough strength to trust a trend → range/transitional.
+    if adx_state == "ranging":
+        regime, mode = "range", "mean-reversion"
+        playbook = ("Ranging: fade value-area / band edges; suppress breakout & "
+                    "EMA/DI crossover signals. DI direction is unreliable here.")
+    elif adx_state == "developing":
+        regime, mode = "transitional", "stand-aside"
+        playbook = ("Developing (ADX 20-25): trend not confirmed. Wait for ADX>25 "
+                    "to commit to trend-following, or treat as range for now.")
+    else:  # trending — require ADX, DI and 200-EMA side to agree
+        bull = di_direction == "bullish" and (above_200 is None or above_200)
+        bear = di_direction == "bearish" and (above_200 is None or not above_200)
+        if bull:
+            regime, mode = "trend_up", "trend-following"
+            playbook = ("Uptrend: trade pullback continuations long; suppress "
+                        "mean-reversion shorts. Don't fade strength.")
+        elif bear:
+            regime, mode = "trend_down", "trend-following"
+            playbook = ("Downtrend: trade pullback continuations short; suppress "
+                        "mean-reversion longs. Don't fade weakness.")
+        else:
+            # Strong ADX but DI direction disagrees with the 200-EMA side.
+            regime, mode = "transitional", "stand-aside"
+            playbook = ("Conflicted: ADX is strong but DI direction and the 200-EMA "
+                        "side disagree (possible reversal/transition). Reduce size.")
+
+    return {
+        "regime": regime,
+        "mode": mode,
+        "adx_state": adx_state,
+        "di_direction": di_direction,
+        "above_200ema": above_200,
+        "playbook": playbook,
+    }
+
+
+def classify_oi_price(oi_change_pct, price_change_pct, flat: float = OI_FLAT_PCT) -> dict:
+    """Open-interest + price quadrant (Plan.md Tier-1 #3). OI alone has no
+    direction; pairing its change with price change classifies the flow. Either
+    axis within ±`flat`% is treated as flat → neutral (no clean quadrant)."""
+    if oi_change_pct is None or price_change_pct is None:
+        return {"quadrant": "neutral", "label": "n/a",
+                "interpretation": "insufficient open-interest/price history"}
+
+    oi_up = oi_change_pct > flat
+    oi_dn = oi_change_pct < -flat
+    px_up = price_change_pct > flat
+    px_dn = price_change_pct < -flat
+
+    if px_up and oi_up:
+        q, label = "long_buildup", "Long build-up"
+        interp = "new money confirming the up-move — healthy, genuine demand."
+    elif px_dn and oi_up:
+        q, label = "short_buildup", "Short build-up"
+        interp = "new shorts confirming the down-move — avoid longs."
+    elif px_up and oi_dn:
+        q, label = "short_covering", "Short covering / squeeze"
+        interp = "rally on closing shorts, not new buyers — weaker, less sustainable."
+    elif px_dn and oi_dn:
+        q, label = "long_liquidation", "Long liquidation / covering"
+        interp = "longs closing or forced out — often capitulation; wait for stabilization."
+    else:
+        q, label = "neutral", "Neutral / flat"
+        interp = "OI and/or price ~flat — no clear positioning signal."
+
+    return {"quadrant": q, "label": label, "interpretation": interp}
+
+
+def classify_long_short(ratio) -> dict:
+    """Global account long/short ratio reframed per Plan.md: the absolute level
+    is noise; only genuine extremes carry (contrarian) content. Most retail
+    accounts sit structurally long, so 'longs dominant' is NOT directional."""
+    if ratio is None:
+        return {"reading": "neutral", "contrarian": None, "note": "n/a"}
+    if ratio >= LS_EXTREME_LONG:
+        return {"reading": "extreme_long_crowding", "contrarian": "bearish",
+                "note": f"overcrowded longs (>= {LS_EXTREME_LONG:g}) — contrarian bearish / long-squeeze fuel."}
+    if ratio <= LS_EXTREME_SHORT:
+        return {"reading": "extreme_short_crowding", "contrarian": "bullish",
+                "note": f"overcrowded shorts (<= {LS_EXTREME_SHORT:g}) — contrarian bullish / short-squeeze fuel."}
+    return {"reading": "neutral", "contrarian": None,
+            "note": "mid-range — noise, not directional (absolute level carries no edge)."}
+
+
+def position_size(equity, risk_pct, entry, atr, atr_mult) -> dict | None:
+    """ATR-normalized position sizing (Plan.md Stage 1 #5). Risk a fixed % of
+    equity across an ATR-multiple stop so size scales inversely with volatility.
+    Returns None on non-positive inputs (can't size)."""
+    if not (equity and equity > 0 and risk_pct and risk_pct > 0
+            and entry and entry > 0 and atr and atr > 0 and atr_mult and atr_mult > 0):
+        return None
+    risk_amount = equity * risk_pct / 100
+    stop_distance = atr * atr_mult
+    qty = risk_amount / stop_distance
+    return {
+        "risk_amount": risk_amount,
+        "stop_distance": stop_distance,
+        "qty": qty,
+        "notional": qty * entry,
     }

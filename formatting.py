@@ -7,7 +7,10 @@ fetched/computed data (see sources.compute_futures_context, indicators.compute_i
 """
 from datetime import datetime, timezone
 
-from indicators import compute_indicators
+from indicators import (
+    compute_indicators, classify_oi_price, classify_long_short,
+    ADX_TREND, ADX_RANGE,
+)
 
 
 def fmt_candle(k):
@@ -60,22 +63,26 @@ def fmt_indicators(values):
     pdi       = values["plus_di"]
     ndi       = values["minus_di"]
 
-    if adx < 20:
-        adx_label = "weak/ranging"
-    elif adx < 25:
-        adx_label = "developing"
+    # ADX as a regime GATE, not a momentum trigger (Plan.md Stage 1 #3):
+    # DI direction is only actionable in a trending regime — below ADX_TREND it
+    # whipsaws, so we explicitly tell the reader to ignore DI crossovers there.
+    if adx < ADX_RANGE:
+        adx_label = "ranging — ignore DI crossovers (mean-reversion regime)"
+        bias = ""
+    elif adx < ADX_TREND:
+        adx_label = "developing — DI not yet reliable, wait for ADX>25"
+        bias = ""
     else:
-        adx_label = "trending"
-
-    bias = ""
-    if adx >= 20:
-        bias = " (bullish bias)" if pdi > ndi else " (bearish bias)"
+        direction = "bullish" if pdi > ndi else "bearish"
+        adx_label = "trending — DI direction actionable"
+        bias = f" ({direction})"
 
     return [
         "Indicators:",
         f"  OBV: {obv:+.0f} ({obv_trend})",
         f"  Volume ratio (current / 20-bar avg): {vol_ratio:.2f}x",
-        f"  ADX(14): {adx:.1f} ({adx_label}) | +DI: {pdi:.1f} | -DI: {ndi:.1f}{bias}",
+        f"  ADX(14): {adx:.1f} [{adx_label}] | +DI: {pdi:.1f} | -DI: {ndi:.1f}{bias}",
+        "  (full regime needs the 200-EMA → use get_regime)",
     ]
 
 
@@ -100,7 +107,7 @@ def fmt_futures_context(ctx):
     else:
         lines.append("  Funding rate:  N/A (no perp for this symbol)")
 
-    # --- open interest (current + 5h trend) ---
+    # --- open interest (current + 5h trend) + OI/price quadrant ---
     if ctx["open_interest"] is not None:
         oi_chg = ctx["oi_change_pct_5h"]
         if oi_chg is None:
@@ -108,15 +115,24 @@ def fmt_futures_context(ctx):
         else:
             oi_trend = f"{'rising' if oi_chg > 0 else 'falling'} ({oi_chg:+.2f}% over 5h)"
         lines.append(f"  Open Interest: {ctx['open_interest']:.4g} {symbol.replace('USDT', '')}  |  Trend: {oi_trend}")
+        # OI alone has no direction — pair its change with price change (Plan.md Tier-1 #3).
+        q = classify_oi_price(oi_chg, ctx.get("price_change_pct_5h"))
+        if q["quadrant"] != "neutral" or oi_chg is not None:
+            px_chg = ctx.get("price_change_pct_5h")
+            px_str = f"price {px_chg:+.2f}%" if px_chg is not None else "price n/a"
+            lines.append(f"  OI quadrant:   {q['label']} ({px_str}, OI {oi_chg:+.2f}% / 5h) — {q['interpretation']}")
     else:
         lines.append("  Open Interest: N/A")
 
-    # --- global long/short account ratio ---
+    # --- global long/short account ratio (demoted: extreme-flag only) ---
     if ctx["long_short_ratio"] is not None:
         ratio = ctx["long_short_ratio"]
-        bias = "longs dominant" if ratio > 1 else "shorts dominant"
-        lines.append(f"  L/S ratio:     {ratio:.3f} ({bias})  |  Long: {ctx['long_pct']:.1f}%  Short: {ctx['short_pct']:.1f}%")
+        ls = classify_long_short(ratio)
+        lines.append(
+            f"  L/S accounts:  {ratio:.3f}  (Long {ctx['long_pct']:.1f}% / Short {ctx['short_pct']:.1f}%) "
+            f"— {ls['note']}"
+        )
     else:
-        lines.append("  L/S ratio:     N/A")
+        lines.append("  L/S accounts:  N/A")
 
     return lines

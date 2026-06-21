@@ -17,7 +17,8 @@ from mcp.server.fastmcp import FastMCP
 import sources
 from indicators import (
     analyze_orderbook, compute_indicators, calc_fibs, calc_ema,
-    calc_vwap, calc_atr, calc_volume_profile,
+    calc_vwap, calc_atr, calc_volume_profile, calc_adx,
+    classify_regime, classify_oi_price, classify_long_short, position_size,
 )
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context
 
@@ -151,6 +152,11 @@ def get_futures_context(symbol: str) -> dict:
     def r(x, ndigits):
         return None if x is None else round(x, ndigits)
 
+    # OI alone has no direction — classify the OI+price quadrant, and demote the
+    # raw L/S ratio to an extreme-only contrarian flag (Plan.md Stage 1 #2, #4).
+    quad = classify_oi_price(ctx["oi_change_pct_5h"], ctx["price_change_pct_5h"])
+    ls = classify_long_short(ctx["long_short_ratio"])
+
     return {
         "symbol": symbol,
         "funding_rate_pct": r(ctx["funding_rate_pct"], 6),
@@ -159,9 +165,14 @@ def get_futures_context(symbol: str) -> dict:
         "index_price": ctx["index_price"],
         "open_interest": ctx["open_interest"],
         "oi_change_pct_5h": r(ctx["oi_change_pct_5h"], 4),
+        "price_change_pct_5h": r(ctx["price_change_pct_5h"], 4),
+        "oi_quadrant": quad["quadrant"],
+        "oi_quadrant_label": quad["label"],
         "long_short_ratio": r(ctx["long_short_ratio"], 4),
         "long_pct": r(ctx["long_pct"], 2),
         "short_pct": r(ctx["short_pct"], 2),
+        "long_short_reading": ls["reading"],
+        "long_short_contrarian": ls["contrarian"],
         "summary": summary,
     }
 
@@ -255,6 +266,71 @@ def get_emas(symbol: str, interval: str = "1h", limit: int = 500) -> dict:
         "ema_200": ema_200,
         "stack": stack,
         "summary": f"{symbol} {interval} EMAs: 20={s(ema_20)} | 50={s(ema_50)} | 200={s(ema_200)} | close={s(current_close)} → {stack_text}",
+    }
+
+
+@mcp.tool()
+def get_regime(symbol: str, interval: str = "4h", limit: int = 300) -> dict:
+    """Classify the trend regime — the meta-filter that should gate every other signal.
+
+    Combines ADX(14) strength with price position vs the 200-EMA to decide which
+    playbook applies, so you don't run mean-reversion in a strong trend (or
+    trend-following in chop) — the single highest-leverage rule in the stack.
+
+    symbol:   pair like 'BTCUSDT' — quote in USDT.
+    interval: candle interval (default 4h; 1h/4h are the documented templates).
+    limit:    candles to fetch. Default 300 seeds the 200-EMA with ~100 bars of
+              warmup; minimum ~200 to get a 200-EMA at all (else regime degrades
+              to ADX+DI only).
+
+    Returns:
+      regime  — trend_up | trend_down | range | transitional
+      mode    — trend-following | mean-reversion | stand-aside
+      adx_state (trending/developing/ranging), di_direction (only in a trend),
+      above_200ema, atr(14) for stop sizing, and a one-line playbook + summary.
+    """
+    symbol = symbol.upper()
+    limit = _clamp_limit(limit)
+    try:
+        candles = sources.fetch_klines(symbol, interval, limit)
+    except Exception as e:
+        return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
+
+    if not candles:
+        return {"error": "no candles returned"}
+
+    closes = [float(k[4]) for k in candles]
+    close = closes[-1]
+    adx, pdi, ndi = calc_adx(candles)
+    ema_200 = calc_ema(closes, 200)
+    atr = calc_atr(candles)
+
+    reg = classify_regime(adx, pdi, ndi, close, ema_200)
+
+    ema_note = "" if ema_200 is not None else " (200-EMA n/a — too few candles; ADX+DI only)"
+    summary = (
+        f"{symbol} {interval} regime: {reg['regime'].upper()} → {reg['mode']} | "
+        f"ADX {adx:.1f} ({reg['adx_state']}), +DI {pdi:.1f}/-DI {ndi:.1f}"
+        f"{f', close {close:.6g} vs 200-EMA {ema_200:.6g}' if ema_200 is not None else ''}"
+        f"{ema_note}\n  {reg['playbook']}"
+    )
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "regime": reg["regime"],
+        "mode": reg["mode"],
+        "adx": round(adx, 2),
+        "adx_state": reg["adx_state"],
+        "plus_di": round(pdi, 2),
+        "minus_di": round(ndi, 2),
+        "di_direction": reg["di_direction"],
+        "current_close": close,
+        "ema_200": ema_200,
+        "above_200ema": reg["above_200ema"],
+        "atr": atr,
+        "playbook": reg["playbook"],
+        "summary": summary,
     }
 
 
@@ -439,17 +515,25 @@ def get_vwap(symbol: str, interval: str = "5m", limit: int = 288) -> dict:
 
 
 @mcp.tool()
-def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 14) -> dict:
-    """ATR(period) for stop placement — NOT a directional signal.
+def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 14,
+            account_equity: float | None = None, risk_pct: float = 1.0,
+            stop_atr_mult: float = 1.5) -> dict:
+    """ATR(period) for stop placement and ATR-normalized position sizing — NOT a
+    directional signal.
 
     symbol:   pair like 'BTCUSDT'.
     interval: candle interval (default 30m for scalp stops).
     limit:    candles to fetch (100 is plenty for a 14-period ATR to settle).
     period:   ATR period (default 14, Wilder's smoothing).
+    account_equity: if given, also return a suggested position size that risks
+                    `risk_pct`% of equity across a `stop_atr_mult`×ATR stop, so
+                    size scales inversely with volatility. Omit to skip sizing.
+    risk_pct:       % of equity to risk per trade (default 1.0).
+    stop_atr_mult:  ATR multiple for the stop distance used in sizing (default 1.5).
 
     Returns the raw ATR plus example stops at 1× and 1.5× ATR from current close,
-    for both long and short. Apply your own multiplier to your entry; this is the
-    distance unit, not a position-sizing recommendation.
+    for both long and short, and (when account_equity is set) the risk amount,
+    stop distance, position size (qty) and notional.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
@@ -470,7 +554,7 @@ def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 
         f"| 1.5× stop: long below {current_close - 1.5 * atr:.6g}, short above {current_close + 1.5 * atr:.6g}"
     )
 
-    return {
+    result = {
         "symbol": symbol,
         "interval": interval,
         "period": period,
@@ -481,8 +565,27 @@ def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 
         "stop_long_1_5x_atr": current_close - 1.5 * atr,
         "stop_short_1x_atr":  current_close + atr,
         "stop_short_1_5x_atr": current_close + 1.5 * atr,
-        "summary": summary,
+        "position_size": None,
+        "risk_amount": None,
+        "stop_distance": None,
+        "notional": None,
     }
+
+    if account_equity is not None:
+        ps = position_size(account_equity, risk_pct, current_close, atr, stop_atr_mult)
+        if ps is not None:
+            result["position_size"] = ps["qty"]
+            result["risk_amount"] = ps["risk_amount"]
+            result["stop_distance"] = ps["stop_distance"]
+            result["notional"] = ps["notional"]
+            summary += (
+                f" | size: risk {risk_pct:g}% of {account_equity:g} = {ps['risk_amount']:.6g} "
+                f"over {stop_atr_mult:g}×ATR ({ps['stop_distance']:.6g}) → "
+                f"{ps['qty']:.6g} units (~{ps['notional']:.6g} notional)"
+            )
+
+    result["summary"] = summary
+    return result
 
 
 @mcp.tool()

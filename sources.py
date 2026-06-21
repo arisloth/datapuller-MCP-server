@@ -168,6 +168,7 @@ def compute_futures_context(symbol: str) -> dict:
         "index_price": None,
         "open_interest": None,
         "oi_change_pct_5h": None,
+        "price_change_pct_5h": None,
         "long_short_ratio": None,
         "long_pct": None,
         "short_pct": None,
@@ -189,6 +190,15 @@ def compute_futures_context(symbol: str) -> dict:
             oi_old = float(hist[0]["sumOpenInterest"])
             oi_new = float(hist[-1]["sumOpenInterest"])
             ctx["oi_change_pct_5h"] = (oi_new - oi_old) / oi_old * 100 if oi_old else 0.0
+            # Implied mark price per snapshot = notional value / contracts. Lets us
+            # measure price change over the *same* window as OI (for the quadrant)
+            # without a second request. Guard against missing/zero fields.
+            val_old = float(hist[0].get("sumOpenInterestValue", 0) or 0)
+            val_new = float(hist[-1].get("sumOpenInterestValue", 0) or 0)
+            if oi_old and oi_new and val_old and val_new:
+                px_old = val_old / oi_old
+                px_new = val_new / oi_new
+                ctx["price_change_pct_5h"] = (px_new - px_old) / px_old * 100 if px_old else 0.0
     except Exception:
         pass
 
