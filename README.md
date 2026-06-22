@@ -1,4 +1,4 @@
-# Binance Data Puller
+# Data Puller
 
 Pulls live crypto market data from public exchange APIs (Binance, Bybit, Hyperliquid —
 no API key needed) and serves it two ways:
