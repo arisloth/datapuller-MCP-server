@@ -13,6 +13,7 @@ ADX_RANGE = 20.0   # ADX <  this => ranging regime; ADX in [20, 25) is transitio
 LS_EXTREME_LONG  = 3.0   # global account L/S >= this => overcrowded longs  (contrarian bearish)
 LS_EXTREME_SHORT = 0.7   # global account L/S <= this => overcrowded shorts (contrarian bullish)
 OI_FLAT_PCT = 0.1        # |change| below this (either axis) => treated as flat in the OI quadrant
+FUNDING_EXTREME_APR = 50.0  # |annualized funding| >= this % => overcrowded (~0.046%/8h). Asset-specific.
 
 
 def calc_obv(candles):
@@ -562,3 +563,63 @@ def detect_squeeze(candles, period: int = 20, bb_mult: float = 2.0, kc_mult: flo
         "kc_lower": kc_lower,
         "state": state,
     }
+
+
+# --- Stage 3 positioning / funding / basis --------------------------------
+# Funding has ~zero single-asset predictive power and can stay extreme for weeks
+# in a trend — treat APR extremes as contrarian *context*, never a timing trigger.
+
+
+def percentile_rank(value, series) -> float | None:
+    """Percentile (0-100) of `value` within `series` = share of points <= value.
+    None if the series is empty."""
+    if not series:
+        return None
+    return sum(1 for x in series if x <= value) / len(series) * 100
+
+
+def annualize_funding(rate, interval_hours: float) -> float | None:
+    """Funding rate (per interval, as a fraction e.g. 0.0001) → annualized APR %.
+    Normalizes venues with different intervals (Binance/Bybit 8h, Hyperliquid 1h)."""
+    if rate is None or not interval_hours:
+        return None
+    return rate * (24.0 / interval_hours) * 365 * 100
+
+
+def infer_funding_interval_hours(history) -> float:
+    """Median gap (hours) between consecutive Binance fundingTime entries.
+    Defaults to 8.0 when it can't be determined."""
+    times = sorted(int(h["fundingTime"]) for h in history if "fundingTime" in h)
+    gaps = [(b - a) / 3_600_000 for a, b in zip(times, times[1:]) if b > a]
+    if not gaps:
+        return 8.0
+    gaps.sort()
+    mid = len(gaps) // 2
+    median = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
+    return round(median) or 8.0
+
+
+def classify_funding(apr, threshold: float = FUNDING_EXTREME_APR) -> dict:
+    """Annualized funding → contrarian extreme flag. Mid-range is context, not a signal."""
+    if apr is None:
+        return {"reading": "neutral", "contrarian": None, "note": "n/a"}
+    if apr >= threshold:
+        return {"reading": "extreme_long_crowding", "contrarian": "bearish",
+                "note": f"funding >= +{threshold:g}% APR — overcrowded longs (contrarian bearish / cascade fuel)."}
+    if apr <= -threshold:
+        return {"reading": "extreme_short_crowding", "contrarian": "bullish",
+                "note": f"funding <= -{threshold:g}% APR — overcrowded shorts (contrarian bullish / squeeze setup)."}
+    return {"reading": "neutral", "contrarian": None,
+            "note": "funding mid-range — context only, not a timing trigger."}
+
+
+def classify_basis(basis_pct, flat: float = 0.02) -> dict:
+    """Perp basis = (mark - index)/index. Positive = contango (leveraged longs paying
+    premium); negative = backwardation (fear). Within ±`flat`% reads as ~flat."""
+    if basis_pct is None:
+        return {"state": "n/a", "note": "n/a"}
+    if basis_pct > flat:
+        return {"state": "contango", "note": "perp above spot — leveraged long demand."}
+    if basis_pct < -flat:
+        return {"state": "backwardation", "note": "perp below spot — fear / weak futures sponsorship."}
+    return {"state": "flat", "note": "perp ~ spot."}

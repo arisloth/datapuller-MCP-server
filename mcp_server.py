@@ -20,6 +20,8 @@ from indicators import (
     calc_vwap, calc_atr, calc_volume_profile, calc_adx,
     classify_regime, classify_oi_price, classify_long_short, position_size,
     calc_cvd, calc_taker_ratio, cvd_divergence, detect_squeeze,
+    annualize_funding, infer_funding_interval_hours, percentile_rank,
+    classify_funding, classify_basis,
 )
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context
 
@@ -161,9 +163,14 @@ def get_futures_context(symbol: str) -> dict:
     return {
         "symbol": symbol,
         "funding_rate_pct": r(ctx["funding_rate_pct"], 6),
+        "funding_apr": r(ctx["funding_apr"], 2),
+        "funding_percentile": r(ctx["funding_percentile"], 1),
+        "funding_reading": ctx["funding_reading"],
         "next_funding": next_funding,
         "mark_price": ctx["mark_price"],
         "index_price": ctx["index_price"],
+        "basis_pct": r(ctx["basis_pct"], 6),
+        "basis_state": ctx["basis_state"],
         "open_interest": ctx["open_interest"],
         "oi_change_pct_5h": r(ctx["oi_change_pct_5h"], 4),
         "price_change_pct_5h": r(ctx["price_change_pct_5h"], 4),
@@ -175,6 +182,91 @@ def get_futures_context(symbol: str) -> dict:
         "long_short_reading": ls["reading"],
         "long_short_contrarian": ls["contrarian"],
         "summary": summary,
+    }
+
+
+@mcp.tool()
+def get_funding(symbol: str) -> dict:
+    """Cross-exchange funding (Binance / Bybit / Hyperliquid), normalized to APR.
+
+    Funding is a positioning/sentiment read, NOT a timing trigger — it has ~zero
+    single-asset predictive power and can stay extreme for weeks in a strong trend.
+    Use APR extremes as a contrarian flag and cross-exchange divergence as a
+    positioning / arbitrage signal.
+
+    symbol: perpetual like 'BTCUSDT'.
+
+    Returns each venue's current funding as annualized APR (Binance interval inferred
+    from its history, Bybit assumed 8h, Hyperliquid 1h), an extreme/percentile read for
+    Binance vs its own history, and a cross-venue divergence (max−min APR). Per-venue
+    null when the symbol isn't listed there.
+    """
+    symbol = symbol.upper()
+
+    binance = None
+    try:
+        pm = sources.fetch_premium_index(symbol)
+        rate = float(pm["lastFundingRate"])
+        hist = sources.fetch_funding_history(symbol, limit=100)
+        interval_h = infer_funding_interval_hours(hist)
+        apr = annualize_funding(rate, interval_h)
+        apr_hist = [annualize_funding(float(h["fundingRate"]), interval_h) for h in hist]
+        pct = percentile_rank(apr, apr_hist)
+        cls = classify_funding(apr)
+        binance = {
+            "rate_pct": round(rate * 100, 6), "interval_hours": interval_h,
+            "apr": round(apr, 2), "percentile": None if pct is None else round(pct, 1),
+            "reading": cls["reading"], "contrarian": cls["contrarian"], "note": cls["note"],
+        }
+    except Exception:
+        pass
+
+    def simple_venue(rate, interval_h):
+        apr = annualize_funding(rate, interval_h)
+        return {"rate_pct": round(rate * 100, 6), "interval_hours": interval_h, "apr": round(apr, 2)}
+
+    bybit = None
+    try:
+        bybit = simple_venue(float(sources.fetch_bybit_ticker(symbol)["fundingRate"]), 8.0)
+    except Exception:
+        pass
+
+    hyper = None
+    try:
+        hyper = simple_venue(float(sources.fetch_hyperliquid_ctx(symbol)["funding"]), 1.0)
+    except Exception:
+        pass
+
+    if binance is None and bybit is None and hyper is None:
+        return {"error": f"no funding data for {symbol} on any venue"}
+
+    aprs = {name: v["apr"] for name, v in (("Binance", binance), ("Bybit", bybit), ("Hyperliquid", hyper)) if v}
+    spread = round(max(aprs.values()) - min(aprs.values()), 2) if len(aprs) >= 2 else None
+
+    def vline(name, v):
+        if v is None:
+            return f"  {name}: n/a (not listed)"
+        extra = ""
+        if "percentile" in v:
+            pc = f", {v['percentile']:.0f}th pct" if v["percentile"] is not None else ""
+            extra = f"  [{v['reading']}{pc}]"
+        return f"  {name}: {v['apr']:+.1f}% APR ({v['rate_pct']:+.4f}%/{v['interval_hours']:g}h){extra}"
+
+    summary_lines = [f"{symbol} cross-exchange funding (annualized):",
+                     vline("Binance", binance), vline("Bybit", bybit), vline("Hyperliquid", hyper)]
+    if spread is not None:
+        flag = " — wide divergence (positioning/arb)" if spread >= 20 else " — aligned"
+        summary_lines.append(f"  Spread: {spread:.1f}% APR{flag}")
+    if binance and binance["note"]:
+        summary_lines.append(f"  → {binance['note']}")
+
+    return {
+        "symbol": symbol,
+        "binance": binance,
+        "bybit": bybit,
+        "hyperliquid": hyper,
+        "apr_spread": spread,
+        "summary": "\n".join(summary_lines),
     }
 
 
@@ -453,13 +545,19 @@ def get_volume_breakdown(symbol: str) -> dict:
     symbol: USDT-quoted pair like 'BTCUSDT'. The base asset (BTC) is used for the
             Coinbase BTC-USD product and the CoinGecko cross-exchange aggregate.
 
-    Returns USD-denominated 24h volumes, each venue's share of the aggregate, and
-    a `thin` flag when aggregate volume is below $1M. Each field is null if its
-    source is unavailable (e.g. no Coinbase listing for an alt).
+    Returns USD-denominated 24h volumes — Binance spot, Coinbase spot, the CoinGecko
+    cross-exchange spot aggregate, and explicit cross-venue PERP volume (Binance /
+    Bybit / Hyperliquid) — plus each spot venue's share of the aggregate, a `thin`
+    flag when aggregate volume is below $1M, and a spot-vs-perp read (Binance spot vs
+    Binance perp). Each field is null if its source is unavailable (e.g. a venue that
+    doesn't list the symbol). Note: spot shares are vs the spot aggregate; the perp
+    figures are a separate cross-venue comparison (not mixed into the spot shares).
 
     Use this for:
       - Coinbase share > usual vs Binance → US / institutional skew on majors.
       - Binance + Coinbase << aggregate → flow concentrated on other venues.
+      - perp_spot_ratio >> 1 → leverage-led (more fragile); ~1 or <1 → spot-led (more durable).
+      - Bybit/Hyperliquid perp vs Binance perp → where leveraged flow concentrates.
       - `thin=true` → treat orderbook/funding signals with caution.
     """
     symbol = symbol.upper()
@@ -474,17 +572,38 @@ def get_volume_breakdown(symbol: str) -> dict:
         "symbol": symbol,
         "base_asset": base,
         "binance_volume_usd": None,
+        "binance_perp_volume_usd": None,
+        "bybit_perp_volume_usd": None,
+        "hyperliquid_perp_volume_usd": None,
         "coinbase_volume_usd": None,
         "aggregate_volume_usd": None,
         "binance_share_pct": None,
         "coinbase_share_pct": None,
         "other_share_pct": None,
+        "perp_spot_ratio": None,
+        "leverage_read": None,
         "thin": None,
     }
 
     try:
         bnb = sources.fetch_24h_binance(symbol)
         result["binance_volume_usd"] = round(float(bnb["quoteVolume"]), 2)
+    except Exception:
+        pass
+
+    try:
+        fut = sources.fetch_24h_futures(symbol)
+        result["binance_perp_volume_usd"] = round(float(fut["quoteVolume"]), 2)
+    except Exception:
+        pass
+
+    try:
+        result["bybit_perp_volume_usd"] = round(float(sources.fetch_bybit_ticker(symbol)["turnover24h"]), 2)
+    except Exception:
+        pass
+
+    try:
+        result["hyperliquid_perp_volume_usd"] = round(float(sources.fetch_hyperliquid_ctx(symbol)["dayNtlVlm"]), 2)
     except Exception:
         pass
 
@@ -513,16 +632,36 @@ def get_volume_breakdown(symbol: str) -> dict:
         result["other_share_pct"] = round(max(0.0, 100 - b - c), 2)
         result["thin"] = agg_usd < THIN_VOLUME_USD
 
+    # Spot-vs-perp (same venue) — leverage-led vs spot-led participation.
+    spot_v, perp_v = result["binance_volume_usd"], result["binance_perp_volume_usd"]
+    if spot_v and perp_v and spot_v > 0:
+        ratio = perp_v / spot_v
+        result["perp_spot_ratio"] = round(ratio, 2)
+        result["leverage_read"] = "perp/leverage-led (more fragile)" if ratio > 1.5 else \
+                                  "balanced" if ratio >= 0.8 else "spot-led (more durable)"
+
     parts = [f"{base} 24h vol:", f"agg={_fmt_usd(agg_usd)}"]
     if result["binance_volume_usd"] is not None:
         share = f" ({result['binance_share_pct']}%)" if result["binance_share_pct"] is not None else ""
-        parts.append(f"Binance={_fmt_usd(result['binance_volume_usd'])}{share}")
+        parts.append(f"Binance spot={_fmt_usd(result['binance_volume_usd'])}{share}")
     if result["coinbase_volume_usd"] is not None:
         share = f" ({result['coinbase_share_pct']}%)" if result["coinbase_share_pct"] is not None else ""
         parts.append(f"Coinbase={_fmt_usd(result['coinbase_volume_usd'])}{share}")
     if result["other_share_pct"] is not None:
         parts.append(f"other={result['other_share_pct']}%")
+    # Cross-venue perp volume (Binance/Bybit/Hyperliquid) — separate from the spot aggregate.
+    perp_bits = [
+        (name, vol) for name, vol in (
+            ("Binance", result["binance_perp_volume_usd"]),
+            ("Bybit", result["bybit_perp_volume_usd"]),
+            ("HL", result["hyperliquid_perp_volume_usd"]),
+        ) if vol is not None
+    ]
+    if perp_bits:
+        parts.append("perp: " + " ".join(f"{name}={_fmt_usd(vol)}" for name, vol in perp_bits))
     summary = " | ".join(parts)
+    if result["perp_spot_ratio"] is not None:
+        summary += f"  | perp/spot {result['perp_spot_ratio']}x → {result['leverage_read']}"
     if result["thin"]:
         summary += "  ⚠ THIN (aggregate < $1M)"
 

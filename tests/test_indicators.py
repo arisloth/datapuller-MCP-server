@@ -15,7 +15,9 @@ from indicators import (  # noqa: E402
     calc_volume_profile, analyze_orderbook, calc_fibs, compute_indicators,
     classify_regime, classify_oi_price, classify_long_short, position_size,
     calc_cvd, calc_taker_ratio, cvd_divergence, calc_bollinger, detect_squeeze,
-    LS_EXTREME_LONG, LS_EXTREME_SHORT,
+    annualize_funding, infer_funding_interval_hours, percentile_rank,
+    classify_funding, classify_basis,
+    LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
 )
 
 
@@ -317,6 +319,74 @@ def test_detect_squeeze_off_when_expanded():
 def test_detect_squeeze_none_too_few():
     candles = [fcandle(i, 100, 10, 5) for i in range(10)]
     assert detect_squeeze(candles, period=20) is None
+
+
+# --- annualize_funding ----------------------------------------------------
+
+def test_annualize_funding_8h_vs_1h():
+    # 0.01%/8h → 0.0001 * 3 * 365 * 100 = 10.95% APR
+    assert annualize_funding(0.0001, 8.0) == pytest.approx(10.95)
+    # same rate hourly → 8x more events → 87.6% APR
+    assert annualize_funding(0.0001, 1.0) == pytest.approx(87.6)
+
+
+def test_annualize_funding_none_inputs():
+    assert annualize_funding(None, 8.0) is None
+    assert annualize_funding(0.0001, 0) is None
+
+
+# --- infer_funding_interval_hours -----------------------------------------
+
+def test_infer_funding_interval_8h():
+    h = 3_600_000
+    hist = [{"fundingTime": i * 8 * h} for i in range(5)]
+    assert infer_funding_interval_hours(hist) == pytest.approx(8.0)
+
+
+def test_infer_funding_interval_default_when_empty():
+    assert infer_funding_interval_hours([]) == 8.0
+
+
+# --- percentile_rank ------------------------------------------------------
+
+def test_percentile_rank():
+    series = [1, 2, 3, 4]
+    assert percentile_rank(4, series) == pytest.approx(100.0)
+    assert percentile_rank(2, series) == pytest.approx(50.0)
+    assert percentile_rank(0, series) == pytest.approx(0.0)
+
+
+def test_percentile_rank_empty():
+    assert percentile_rank(5, []) is None
+
+
+# --- classify_funding -----------------------------------------------------
+
+def test_classify_funding_extreme_long():
+    r = classify_funding(FUNDING_EXTREME_APR + 10)
+    assert r["reading"] == "extreme_long_crowding"
+    assert r["contrarian"] == "bearish"
+
+
+def test_classify_funding_extreme_short():
+    r = classify_funding(-(FUNDING_EXTREME_APR + 10))
+    assert r["reading"] == "extreme_short_crowding"
+    assert r["contrarian"] == "bullish"
+
+
+def test_classify_funding_neutral():
+    r = classify_funding(10.0)
+    assert r["reading"] == "neutral"
+    assert r["contrarian"] is None
+
+
+# --- classify_basis -------------------------------------------------------
+
+def test_classify_basis_states():
+    assert classify_basis(0.5)["state"] == "contango"
+    assert classify_basis(-0.5)["state"] == "backwardation"
+    assert classify_basis(0.0)["state"] == "flat"
+    assert classify_basis(None)["state"] == "n/a"
 
 
 # --- classify_regime ------------------------------------------------------

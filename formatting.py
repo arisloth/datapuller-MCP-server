@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from indicators import (
     compute_indicators, classify_oi_price, classify_long_short,
-    ADX_TREND, ADX_RANGE,
+    classify_funding, classify_basis, ADX_TREND, ADX_RANGE,
 )
 
 
@@ -130,10 +130,25 @@ def fmt_futures_context(ctx):
     if ctx["funding_rate_pct"] is not None:
         rate = ctx["funding_rate_pct"]
         next_ts = datetime.fromtimestamp(ctx["next_funding"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        direction = "longs pay shorts (bullish overheat)" if rate >= 0 else "shorts pay longs (bearish overheat)"
-        lines.append(f"  Funding rate:  {rate:+.4f}% per 8h  →  {direction}")
+        direction = "longs pay shorts" if rate >= 0 else "shorts pay longs"
+        apr = ctx.get("funding_apr")
+        pct = ctx.get("funding_percentile")
+        if apr is not None:
+            extra = f" ({apr:+.1f}% APR"
+            if pct is not None:
+                extra += f", {pct:.0f}th pct"
+            extra += ")"
+            note = classify_funding(apr)["note"]
+        else:
+            extra, note = "", ""
+        lines.append(f"  Funding rate:  {rate:+.4f}%/interval{extra}  →  {direction}")
+        if note:
+            lines.append(f"                 {note}")
         lines.append(f"  Next funding:  {next_ts}")
         lines.append(f"  Mark price:    {ctx['mark_price']:.4g}  |  Index: {ctx['index_price']:.4g}")
+        if ctx.get("basis_pct") is not None:
+            b = classify_basis(ctx["basis_pct"])
+            lines.append(f"  Perp basis:    {ctx['basis_pct']:+.4f}% ({b['state']}) — {b['note']}")
     else:
         lines.append("  Funding rate:  N/A (no perp for this symbol)")
 

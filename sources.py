@@ -6,11 +6,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import indicators
+
 BASE             = "https://api.binance.com/api/v3/klines"
 DEPTH_BASE       = "https://api.binance.com/api/v3/depth"
 TICKER_24H_BASE  = "https://api.binance.com/api/v3/ticker/24hr"
 FAPI_BASE        = "https://fapi.binance.com"
 BYBIT_DEPTH_BASE = "https://api.bybit.com/v5/market/orderbook"
+BYBIT_TICKER_BASE = "https://api.bybit.com/v5/market/tickers"
 HYPERLIQUID_API  = "https://api.hyperliquid.xyz/info"
 COINBASE_BASE    = "https://api.exchange.coinbase.com"
 COINGECKO_BASE   = "https://api.coingecko.com/api/v3"
@@ -80,6 +83,37 @@ def fetch_orderbook_bybit(symbol: str) -> dict:
     }
 
 
+def fetch_bybit_ticker(symbol: str) -> dict:
+    """Bybit v5 linear ticker: funding rate, next funding, mark/index price, 24h turnover.
+    Bybit funds every 8h for majors (some alts differ)."""
+    r = SESSION.get(
+        BYBIT_TICKER_BASE,
+        params={"category": "linear", "symbol": symbol},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data["retCode"] != 0:
+        raise ValueError(data["retMsg"])
+    lst = data["result"]["list"]
+    if not lst:
+        raise ValueError(f"bybit: no ticker for {symbol}")
+    return lst[0]
+
+
+def fetch_hyperliquid_ctx(symbol: str) -> dict:
+    """Hyperliquid per-asset context: funding (HOURLY), mark/oracle price, OI, 24h notional vol.
+    Raises if the coin isn't listed."""
+    coin = symbol[:-4] if symbol.endswith("USDT") else symbol
+    r = SESSION.post(HYPERLIQUID_API, json={"type": "metaAndAssetCtxs"}, timeout=TIMEOUT)
+    r.raise_for_status()
+    meta, ctxs = r.json()
+    for i, asset in enumerate(meta["universe"]):
+        if asset["name"] == coin:
+            return ctxs[i]
+    raise ValueError(f"hyperliquid: no perp for {coin}")
+
+
 def fetch_orderbook_hyperliquid(symbol: str, limit: int = 20) -> dict:
     coin = symbol[:-4] if symbol.endswith("USDT") else symbol
     r = SESSION.post(
@@ -98,6 +132,21 @@ def fetch_orderbook_hyperliquid(symbol: str, limit: int = 20) -> dict:
 
 def fetch_premium_index(symbol: str) -> dict:
     r = SESSION.get(f"{FAPI_BASE}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_funding_history(symbol: str, limit: int = 100) -> list:
+    """Binance settled funding-rate history (newest last) — for extremes/percentile.
+    Each row: {symbol, fundingTime (ms), fundingRate, markPrice}."""
+    r = SESSION.get(f"{FAPI_BASE}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": limit}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_24h_futures(symbol: str) -> dict:
+    """Binance USDⓈ-M perp 24h ticker: quoteVolume (USDT) for spot-vs-perp comparison."""
+    r = SESSION.get(f"{FAPI_BASE}/fapi/v1/ticker/24hr", params={"symbol": symbol}, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -177,9 +226,14 @@ def compute_futures_context(symbol: str) -> dict:
     ctx = {
         "symbol": symbol,
         "funding_rate_pct": None,
+        "funding_apr": None,
+        "funding_percentile": None,
+        "funding_reading": None,
         "next_funding": None,
         "mark_price": None,
         "index_price": None,
+        "basis_pct": None,
+        "basis_state": None,
         "open_interest": None,
         "oi_change_pct_5h": None,
         "price_change_pct_5h": None,
@@ -194,6 +248,21 @@ def compute_futures_context(symbol: str) -> dict:
         ctx["next_funding"] = int(pm["nextFundingTime"])
         ctx["mark_price"] = float(pm["markPrice"])
         ctx["index_price"] = float(pm["indexPrice"])
+        if ctx["index_price"]:
+            ctx["basis_pct"] = (ctx["mark_price"] - ctx["index_price"]) / ctx["index_price"] * 100
+            ctx["basis_state"] = indicators.classify_basis(ctx["basis_pct"])["state"]
+    except Exception:
+        pass
+
+    # Funding depth: annualize current funding and rank it vs settled history.
+    try:
+        hist = fetch_funding_history(symbol, limit=100)
+        if hist and ctx["funding_rate_pct"] is not None:
+            interval_h = indicators.infer_funding_interval_hours(hist)
+            ctx["funding_apr"] = indicators.annualize_funding(ctx["funding_rate_pct"] / 100, interval_h)
+            apr_hist = [indicators.annualize_funding(float(h["fundingRate"]), interval_h) for h in hist]
+            ctx["funding_percentile"] = indicators.percentile_rank(ctx["funding_apr"], apr_hist)
+            ctx["funding_reading"] = indicators.classify_funding(ctx["funding_apr"])["reading"]
     except Exception:
         pass
 
