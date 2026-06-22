@@ -17,6 +17,7 @@ from indicators import (  # noqa: E402
     calc_cvd, calc_taker_ratio, cvd_divergence, calc_bollinger, detect_squeeze,
     annualize_funding, infer_funding_interval_hours, percentile_rank,
     classify_funding, classify_basis,
+    pct_returns, correlation, beta, classify_correlation, classify_rotation,
     LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
 )
 
@@ -387,6 +388,65 @@ def test_classify_basis_states():
     assert classify_basis(-0.5)["state"] == "backwardation"
     assert classify_basis(0.0)["state"] == "flat"
     assert classify_basis(None)["state"] == "n/a"
+
+
+# --- pct_returns / correlation / beta -------------------------------------
+
+def test_pct_returns():
+    assert pct_returns([100, 110, 99]) == pytest.approx([0.1, -0.1])
+
+
+def test_correlation_perfect_positive():
+    xs = [1, 2, 3, 4, 5]
+    ys = [2, 4, 6, 8, 10]   # ys = 2*xs → r = 1
+    assert correlation(xs, ys) == pytest.approx(1.0)
+
+
+def test_correlation_perfect_negative():
+    xs = [1, 2, 3, 4, 5]
+    ys = [10, 8, 6, 4, 2]
+    assert correlation(xs, ys) == pytest.approx(-1.0)
+
+
+def test_correlation_zero_variance_is_none():
+    assert correlation([1, 1, 1], [1, 2, 3]) is None
+    assert correlation([5], [5]) is None
+
+
+def test_beta_known_slope():
+    # alt moves 2x BTC → beta 2
+    btc = [0.01, -0.02, 0.03, -0.01]
+    alt = [2 * x for x in btc]
+    assert beta(alt, btc) == pytest.approx(2.0)
+
+
+def test_beta_zero_btc_variance_is_none():
+    assert beta([0.01, 0.02], [0.0, 0.0]) is None
+
+
+# --- classify_correlation -------------------------------------------------
+
+def test_classify_correlation_high_vs_low():
+    assert classify_correlation(0.9)["level"] == "high"
+    assert classify_correlation(0.3)["level"] == "low"
+    assert classify_correlation(0.65)["level"] == "moderate"
+    assert classify_correlation(None)["level"] == "n/a"
+
+
+# --- classify_rotation ----------------------------------------------------
+
+def test_classify_rotation_btc_dominant():
+    assert classify_rotation(True, 1.0)["read"] == "btc_dominant"
+
+
+def test_classify_rotation_alt_rotation():
+    # BTC.D falling + total cap rising → rotation into alts
+    assert classify_rotation(False, 2.0)["read"] == "alt_rotation"
+
+
+def test_classify_rotation_risk_off():
+    # BTC.D falling + total cap falling → risk-off
+    assert classify_rotation(False, -2.0)["read"] == "risk_off"
 
 
 # --- classify_regime ------------------------------------------------------

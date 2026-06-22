@@ -14,6 +14,8 @@ LS_EXTREME_LONG  = 3.0   # global account L/S >= this => overcrowded longs  (con
 LS_EXTREME_SHORT = 0.7   # global account L/S <= this => overcrowded shorts (contrarian bullish)
 OI_FLAT_PCT = 0.1        # |change| below this (either axis) => treated as flat in the OI quadrant
 FUNDING_EXTREME_APR = 50.0  # |annualized funding| >= this % => overcrowded (~0.046%/8h). Asset-specific.
+CORR_HIGH = 0.8   # alt-vs-BTC corr >= this => "just BTC beta" (trade BTC's regime)
+CORR_LOW  = 0.5   # corr <= this => decoupled enough that alt-specific setups carry edge
 
 
 def calc_obv(candles):
@@ -623,3 +625,77 @@ def classify_basis(basis_pct, flat: float = 0.02) -> dict:
     if basis_pct < -flat:
         return {"state": "backwardation", "note": "perp below spot — fear / weak futures sponsorship."}
     return {"state": "flat", "note": "perp ~ spot."}
+
+
+# --- Stage 4 context layers (correlation, breadth) ------------------------
+# Tells you *when* alt-specific analysis is worth doing, and the higher-timeframe
+# rotation backdrop. All keyless: correlation from klines, breadth from CoinGecko.
+
+
+def pct_returns(closes):
+    """Bar-to-bar percentage returns from a close series."""
+    return [(closes[i] - closes[i - 1]) / closes[i - 1]
+            for i in range(1, len(closes)) if closes[i - 1]]
+
+
+def correlation(xs, ys):
+    """Pearson correlation of two equal-length series. None if <2 points or either
+    series has zero variance."""
+    n = min(len(xs), len(ys))
+    if n < 2:
+        return None
+    xs, ys = xs[-n:], ys[-n:]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx == 0 or vy == 0:
+        return None
+    return cov / (vx * vy) ** 0.5
+
+
+def beta(alt_returns, btc_returns):
+    """Beta of alt vs BTC = cov(alt,btc)/var(btc). None if BTC variance is 0."""
+    n = min(len(alt_returns), len(btc_returns))
+    if n < 2:
+        return None
+    a, b = alt_returns[-n:], btc_returns[-n:]
+    ma = sum(a) / n
+    mb = sum(b) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    vb = sum((y - mb) ** 2 for y in b)
+    if vb == 0:
+        return None
+    return cov / vb
+
+
+def classify_correlation(r) -> dict:
+    """Alt-vs-BTC correlation → whether alt-specific analysis is worth doing."""
+    if r is None:
+        return {"level": "n/a", "note": "n/a"}
+    if r >= CORR_HIGH:
+        return {"level": "high", "note": "moves as leveraged BTC beta — trade BTC's regime, not alt specifics."}
+    if r <= -CORR_HIGH:
+        return {"level": "inverse", "note": "strongly inverse to BTC — unusual; treat with caution."}
+    if r <= CORR_LOW:
+        return {"level": "low", "note": "decoupled — alt-specific setups carry independent edge."}
+    return {"level": "moderate", "note": "partly BTC-driven — weight alt-specific signals accordingly."}
+
+
+def classify_rotation(btc_dom_rising, total_cap_change_pct, flat: float = 0.2) -> dict:
+    """Capital-rotation read from BTC.D direction + total-cap change. NOTE: raw BTC.D
+    includes stablecoins — cross-check USDT.D before calling 'altseason'."""
+    up = total_cap_change_pct is not None and total_cap_change_pct > flat
+    down = total_cap_change_pct is not None and total_cap_change_pct < -flat
+    if btc_dom_rising:
+        return {"read": "btc_dominant",
+                "note": "BTC.D rising — capital concentrating in BTC; alts likely bleed (check USDT.D)."}
+    # BTC.D falling:
+    if up:
+        return {"read": "alt_rotation",
+                "note": "BTC.D falling + total cap rising — rotation into alts (early-altseason tilt; confirm USDT.D)."}
+    if down:
+        return {"read": "risk_off",
+                "note": "BTC.D falling + total cap falling — broad risk-off / 'stablecoin season', not altseason."}
+    return {"read": "neutral", "note": "BTC.D easing with flat total cap — no clear rotation."}

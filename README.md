@@ -12,7 +12,7 @@ no API key needed) and serves it two ways:
 | File | Role |
 |------|------|
 | `sources.py` | Raw HTTP fetchers, return parsed JSON |
-| `indicators.py` | Pure math — OBV, volume ratio, ADX, EMA/ATR/VWAP, volume profile, order-book imbalance, Fibonacci, the Stage-1 interpretation layer (trend regime, OI/price quadrant, L/S extreme flag, ATR position sizing), the Stage-2 order-flow layer (CVD + divergence, taker buy/sell ratio, Bollinger width / TTM squeeze), and the Stage-3 positioning layer (funding APR/extremes, perp basis) |
+| `indicators.py` | Pure math — OBV, volume ratio, ADX, EMA/ATR/VWAP, volume profile, order-book imbalance, Fibonacci, the Stage-1 interpretation layer (trend regime, OI/price quadrant, L/S extreme flag, ATR position sizing), the Stage-2 order-flow layer (CVD + divergence, taker buy/sell ratio, Bollinger width / TTM squeeze), the Stage-3 positioning layer (funding APR/extremes, perp basis), and the Stage-4 context layer (BTC correlation/beta, market-cap rotation) |
 | `formatting.py` | Text renderers shared by the CLI and the tool summaries |
 | `FetchKlines.py` | CLI snapshot tool |
 | `mcp_server.py` | MCP (stdio) server exposing the tools |
@@ -56,6 +56,8 @@ Each tool returns structured fields **plus** a `summary` text block, and returns
 | `get_vwap` | `symbol`, `interval="5m"`, `limit=288` | Session VWAP (resets at 00:00 UTC) + window VWAP, each with 1σ/2σ bands, plus a long/short/neutral bias vs current close |
 | `get_atr` | `symbol`, `interval="30m"`, `limit=100`, `period=14`, `account_equity=None`, `risk_pct=1.0`, `stop_atr_mult=1.5` | ATR(14) and example 1×/1.5× ATR stop distances for long and short. Pass `account_equity` to also get an ATR-normalized **position size** (risk `risk_pct`% across a `stop_atr_mult`×ATR stop) — for stop placement and sizing, not direction |
 | `get_volume_profile` | `symbol`, `interval="15m"`, `limit=192`, `bins=24` | POC, value area (70%), top 5 high-volume nodes, and whether the current close sits inside the value area |
+| `get_correlation` | `symbol`, `interval="1h"`, `limit=200`, `btc="BTCUSDT"` | Rolling **correlation + beta** of an alt vs BTC, a recent-half correlation with a **decoupling** flag, and a gating read (high corr → trade BTC's regime; low → alt-specific edge valid) |
+| `get_market_breadth` | _(none)_ | Total market cap + 24h change, TOTAL2 (ex-BTC), BTC/ETH/stablecoin **dominance** with BTC.D direction, ETH/BTC bellwether, and a **rotation read** (btc-dominant / alt-rotation / risk-off) for higher-timeframe alt bias |
 
 `symbol` is a pair like `BTCUSDT`, `ETHUSDT`, `ZECUSDT` (quote in USDT).
 
@@ -111,7 +113,11 @@ claude mcp add binance-data -- \
   reasoning, and avoids hammering rate limits.
 - The most recent candle may be in progress (incomplete), same as the raw exchange data.
 - Binance public endpoints are rate-limited; on-demand tool calls stay well within limits.
-- All data is from **keyless public APIs**. Liquidation data is intentionally out of scope: it
-  isn't exposed by keyless public REST (Binance `allForceOrders` returns 400; Bybit is
-  WebSocket-only), so it would require a paid/keyed source (e.g. Coinglass). Cascade *risk* is
-  instead readable from the OI quadrant, funding extremes, and ATR.
+- All data is from **keyless public APIs**. Two signal classes are intentionally out of scope
+  because they aren't available keyless:
+  - **Liquidations** — not exposed by keyless public REST (Binance `allForceOrders` returns 400;
+    Bybit is WebSocket-only). Cascade *risk* is instead readable from the OI quadrant, funding
+    extremes, and ATR.
+  - **On-chain flows** (exchange netflows, stablecoin/whale activity) — require a paid/keyed
+    provider (Glassnode/CryptoQuant/Nansen) with no price-derivable proxy.
+  Both would need a paid/keyed source to add later.

@@ -116,6 +116,48 @@ def fmt_indicators(values):
     ]
 
 
+def _fmt_big_usd(v):
+    if v is None:
+        return "n/a"
+    if v >= 1e12: return f"${v / 1e12:.2f}T"
+    if v >= 1e9:  return f"${v / 1e9:.2f}B"
+    if v >= 1e6:  return f"${v / 1e6:.2f}M"
+    return f"${v:.0f}"
+
+
+def fmt_market_breadth(m):
+    """Render market-breadth lines from a fully-populated metrics dict (built by
+    mcp_server.get_market_breadth). Pure render; every field is guarded for None."""
+    lines = ["=== Market Breadth (higher-timeframe bias) ==="]
+
+    tc = m.get("total_mcap_usd")
+    chg = m.get("total_cap_change_24h_pct")
+    chg_s = f" ({chg:+.2f}% 24h)" if chg is not None else ""
+    lines.append(f"  Total market cap: {_fmt_big_usd(tc)}{chg_s}")
+    if m.get("total2_usd") is not None:
+        lines.append(f"  TOTAL2 (ex-BTC):  {_fmt_big_usd(m['total2_usd'])}")
+
+    bd, ed, sd = m.get("btc_dominance"), m.get("eth_dominance"), m.get("stablecoin_dominance")
+    if bd is not None:
+        dir_s = ""
+        if m.get("btc_dom_rising") is not None:
+            dir_s = " rising" if m["btc_dom_rising"] else " falling"
+        parts = [f"BTC.D {bd:.2f}%{dir_s}"]
+        if ed is not None:
+            parts.append(f"ETH.D {ed:.2f}%")
+        if sd is not None:
+            parts.append(f"stables {sd:.2f}%")
+        lines.append("  Dominance: " + " | ".join(parts))
+
+    if m.get("ethbtc_24h_pct") is not None:
+        lines.append(f"  ETH/BTC (alt bellwether): {m['ethbtc_24h_pct']:+.2f}% 24h")
+
+    if m.get("rotation_note"):
+        lines.append(f"  → rotation: {m['rotation_note']}")
+
+    return lines
+
+
 def fmt_futures_context(ctx):
     """Render the futures-context lines from a sources.compute_futures_context()
     dict (passing a symbol string is still accepted and triggers one fetch)."""

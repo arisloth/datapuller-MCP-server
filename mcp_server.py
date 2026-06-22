@@ -22,8 +22,10 @@ from indicators import (
     calc_cvd, calc_taker_ratio, cvd_divergence, detect_squeeze,
     annualize_funding, infer_funding_interval_hours, percentile_rank,
     classify_funding, classify_basis,
+    pct_returns, correlation, beta, classify_correlation, classify_rotation,
+    CORR_HIGH,
 )
-from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context
+from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context, fmt_market_breadth
 
 mcp = FastMCP("binance-data")
 
@@ -524,6 +526,130 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300) -> dict:
         "playbook": reg["playbook"],
         "summary": summary,
     }
+
+
+@mcp.tool()
+def get_correlation(symbol: str, interval: str = "1h", limit: int = 200, btc: str = "BTCUSDT") -> dict:
+    """Rolling correlation + beta of an alt vs BTC — tells you *when* alt-specific
+    analysis is even worth doing.
+
+    High correlation (>=0.8) means the alt is just leveraged BTC beta: trade BTC's
+    regime, not alt specifics. A genuine drop in correlation = the alt is decoupling on
+    idiosyncratic flow, and only then do alt-specific setups carry independent edge.
+
+    symbol:   alt pair like 'SOLUSDT' — quote in USDT.
+    interval: candle interval (default 1h). limit: candles to correlate (default 200).
+    btc:      BTC reference pair (default 'BTCUSDT').
+
+    Returns Pearson correlation + beta over the window, a recent-half correlation and a
+    `decoupling` flag (recent ≪ full), and a gating read. corr=beta=1.0 for BTC itself.
+    """
+    symbol = symbol.upper()
+    btc = btc.upper()
+    limit = _clamp_limit(limit)
+    if symbol == btc:
+        return {"symbol": symbol, "interval": interval, "btc": btc, "correlation": 1.0,
+                "beta": 1.0, "recent_correlation": 1.0, "decoupling": False, "level": "self",
+                "summary": f"{symbol} is the BTC reference — correlation 1.0 by definition."}
+
+    try:
+        alt = sources.fetch_klines(symbol, interval, limit)
+        ref = sources.fetch_klines(btc, interval, limit)
+    except Exception as e:
+        return {"error": f"failed to fetch klines: {e}"}
+
+    n = min(len(alt), len(ref))
+    if n < 3:
+        return {"error": f"not enough overlapping candles to correlate (got {n})"}
+    a_ret = pct_returns([float(k[4]) for k in alt][-n:])
+    b_ret = pct_returns([float(k[4]) for k in ref][-n:])
+
+    r = correlation(a_ret, b_ret)
+    bta = beta(a_ret, b_ret)
+    half = max(2, len(a_ret) // 2)
+    r_recent = correlation(a_ret[-half:], b_ret[-half:])
+    decoupling = bool(r is not None and r_recent is not None and r_recent < r - 0.2 and r_recent < CORR_HIGH)
+    cls = classify_correlation(r)
+
+    def rnd(x, d):
+        return None if x is None else round(x, d)
+
+    rstr = "n/a" if r is None else f"{r:.2f}"
+    bstr = "n/a" if bta is None else f"{bta:.2f}"
+    summary = (f"{symbol} vs {btc} ({interval}, {n} bars): corr {rstr} [{cls['level']}], beta {bstr}"
+               f"{' | ⚠ decoupling (recent corr ' + format(r_recent, '.2f') + ')' if decoupling else ''}"
+               f"\n  → {cls['note']}")
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "btc": btc,
+        "correlation": rnd(r, 4),
+        "recent_correlation": rnd(r_recent, 4),
+        "beta": rnd(bta, 4),
+        "decoupling": decoupling,
+        "level": cls["level"],
+        "summary": summary,
+    }
+
+
+@mcp.tool()
+def get_market_breadth() -> dict:
+    """Market-wide breadth for higher-timeframe / alt bias (no symbol).
+
+    Combines CoinGecko global metrics (total market cap + 24h change, BTC/ETH/stablecoin
+    dominance) with Binance 24h moves to derive BTC dominance *direction* and the ETH/BTC
+    alt-bellwether, then reads the capital-rotation backdrop.
+
+    Returns total market cap, TOTAL2 (ex-BTC), dominance %s, BTC.D direction, ETH/BTC 24h,
+    and a rotation read (btc_dominant / alt_rotation / risk_off / neutral).
+
+    Caveat: raw BTC.D includes ~$300B+ of stablecoins — a falling BTC.D in a sell-off can be
+    'stablecoin season', not altseason. Read total-cap direction + stablecoin dominance together.
+    """
+    m = {
+        "total_mcap_usd": None, "total_cap_change_24h_pct": None, "total2_usd": None,
+        "btc_dominance": None, "eth_dominance": None, "stablecoin_dominance": None,
+        "btc_24h_pct": None, "btc_dom_rising": None, "ethbtc_24h_pct": None,
+        "rotation_read": None, "rotation_note": None,
+    }
+
+    try:
+        g = sources.fetch_global_metrics()
+        m["total_mcap_usd"] = round(g["total_market_cap"]["usd"])
+        m["total_cap_change_24h_pct"] = round(g["market_cap_change_percentage_24h_usd"], 2)
+        mc = g["market_cap_percentage"]
+        m["btc_dominance"] = round(mc["btc"], 2) if "btc" in mc else None
+        m["eth_dominance"] = round(mc["eth"], 2) if "eth" in mc else None
+        if "usdt" in mc or "usdc" in mc:
+            m["stablecoin_dominance"] = round((mc.get("usdt") or 0) + (mc.get("usdc") or 0), 2)
+        if m["btc_dominance"] is not None and m["total_mcap_usd"]:
+            m["total2_usd"] = round(m["total_mcap_usd"] * (1 - m["btc_dominance"] / 100))
+    except Exception:
+        pass
+
+    if m["total_mcap_usd"] is None:
+        return {"error": "failed to fetch global market metrics"}
+
+    try:
+        m["btc_24h_pct"] = round(float(sources.fetch_24h_binance("BTCUSDT")["priceChangePercent"]), 2)
+        if m["total_cap_change_24h_pct"] is not None:
+            m["btc_dom_rising"] = m["btc_24h_pct"] > m["total_cap_change_24h_pct"]
+    except Exception:
+        pass
+
+    try:
+        m["ethbtc_24h_pct"] = round(float(sources.fetch_24h_binance("ETHBTC")["priceChangePercent"]), 2)
+    except Exception:
+        pass
+
+    if m["btc_dom_rising"] is not None:
+        rot = classify_rotation(m["btc_dom_rising"], m["total_cap_change_24h_pct"])
+        m["rotation_read"] = rot["read"]
+        m["rotation_note"] = rot["note"]
+
+    m["summary"] = "\n".join(fmt_market_breadth(m))
+    return m
 
 
 THIN_VOLUME_USD = 1_000_000  # aggregate 24h USD below this → thin/illiquid alt

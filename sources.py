@@ -205,6 +205,15 @@ def fetch_aggregate_volume(base: str, quote: str = "USD") -> float:
     return float(vol)
 
 
+def fetch_global_metrics() -> dict:
+    """CoinGecko global metrics: total market cap (USD), its 24h % change, and the
+    market-cap dominance % per asset (btc, eth, usdt, usdc, ...). Keyless public API.
+    Returns the `data` object."""
+    r = SESSION.get(f"{COINGECKO_BASE}/global", timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()["data"]
+
+
 def fetch_long_short_ratio(symbol: str, period: str = "1h", limit: int = 1) -> list:
     r = SESSION.get(
         f"{FAPI_BASE}/futures/data/globalLongShortAccountRatio",
