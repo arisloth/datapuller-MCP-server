@@ -19,6 +19,7 @@ from indicators import (
     analyze_orderbook, compute_indicators, calc_fibs, calc_ema,
     calc_vwap, calc_atr, calc_volume_profile, calc_adx,
     classify_regime, classify_oi_price, classify_long_short, position_size,
+    calc_cvd, calc_taker_ratio, cvd_divergence, detect_squeeze,
 )
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context
 
@@ -184,8 +185,11 @@ def get_indicators(symbol: str, interval: str = "1h", limit: int = 60) -> dict:
     symbol:   pair like 'BTCUSDT' — quote in USDT.
     interval: candle interval (e.g. 15m, 1h, 4h, 1d). limit: candles to analyze.
 
-    Returns OBV (+trend), volume ratio vs 20-bar average, ADX(14) with +DI/-DI, and
-    Fibonacci retracement levels of the window's swing, plus a text summary.
+    Returns OBV (+trend), CVD (+trend & price divergence), taker buy/sell ratio,
+    volume ratio vs 20-bar average, ADX(14) with +DI/-DI (regime-gated), a TTM
+    squeeze flag with Bollinger band width, and Fibonacci retracement levels of the
+    window's swing, plus a text summary. (CVD/taker are null if the rows carry no
+    taker data; for spot-vs-perp CVD divergence use get_cvd.)
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
@@ -201,16 +205,112 @@ def get_indicators(symbol: str, interval: str = "1h", limit: int = 60) -> dict:
     summary_lines.append("Fibonacci retracements (swing high → low):")
     summary_lines += fmt_fibs(fibs)
 
+    def r(x, ndigits):
+        return None if x is None else round(x, ndigits)
+
     return {
         "symbol": symbol,
         "interval": interval,
         "obv": round(ind["obv"], 2),
         "obv_trend": ind["obv_trend"],
+        "cvd": r(ind["cvd"], 2),
+        "cvd_trend": ind["cvd_trend"],
+        "cvd_divergence": ind["cvd_divergence"],
+        "taker_ratio": r(ind["taker_ratio"], 4),
         "volume_ratio": round(ind["volume_ratio"], 4),
         "adx": round(ind["adx"], 2),
         "plus_di": round(ind["plus_di"], 2),
         "minus_di": round(ind["minus_di"], 2),
+        "squeeze_on": ind["squeeze_on"],
+        "bbw": r(ind["bbw"], 6),
+        "bbw_state": ind["bbw_state"],
         "fibs": fibs,
+        "summary": "\n".join(summary_lines),
+    }
+
+
+@mcp.tool()
+def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
+    """Cumulative Volume Delta on perp + spot, with spot-vs-perp divergence.
+
+    CVD is the running net of taker-buy minus taker-sell volume (aggressor intent),
+    built from kline taker-buy volume — impossible to spoof, unlike order-book depth.
+    The absolute value is meaningless (start-point dependent): read the trend, the
+    CVD-vs-price divergence, and especially the SPOT-vs-PERP split.
+
+    symbol:   pair like 'BTCUSDT' — quote in USDT.
+    interval: candle interval (default 15m; keep >=1m — sub-minute CVD is HFT/wash noise).
+    limit:    candles to analyze (default 96 = 24h of 15m bars).
+
+    Returns per-market (perp & spot) CVD, trend, taker buy/sell ratio, price change,
+    and a coarse CVD-vs-price divergence flag, plus a spot-vs-perp read: a rally on
+    strong perp CVD but weak spot CVD is leverage-led and fragile; spot-led CVD is
+    higher-conviction accumulation. Degrades to a single market when one is unlisted.
+    """
+    symbol = symbol.upper()
+    limit = _clamp_limit(limit)
+
+    def market_cvd(fetcher):
+        try:
+            candles = fetcher(symbol, interval, limit)
+        except Exception:
+            return None
+        if not candles:
+            return None
+        cvd, trend = calc_cvd(candles)
+        if cvd is None:
+            return None
+        div = cvd_divergence(candles)
+        taker = calc_taker_ratio(candles)
+        first_close, last_close = float(candles[0][4]), float(candles[-1][4])
+        price_chg = (last_close - first_close) / first_close * 100 if first_close else 0.0
+        return {
+            "cvd": round(cvd, 2),
+            "cvd_trend": trend,
+            "divergence": div["divergence"],
+            "price_trend": div["price_trend"],
+            "taker_ratio": None if taker is None else round(taker, 4),
+            "price_change_pct": round(price_chg, 2),
+        }
+
+    perp = market_cvd(sources.fetch_klines_futures)
+    spot = market_cvd(sources.fetch_klines_spot)
+    if perp is None and spot is None:
+        return {"error": f"no spot or perp kline/taker data for {symbol} {interval}"}
+
+    # Spot-vs-perp conviction read (the highest-value CVD application for a perps trader).
+    spot_perp = None
+    if perp and spot:
+        pr, sp = perp["cvd_trend"], spot["cvd_trend"]
+        if pr == "rising" and sp == "rising":
+            spot_perp = "broad-based — spot AND perp CVD rising (durable)"
+        elif pr == "rising" and sp != "rising":
+            spot_perp = "perp-led / leverage-driven — weak spot CVD (fragile, prone to reversal)"
+        elif sp == "rising" and pr != "rising":
+            spot_perp = "spot-led accumulation — higher conviction (often institutional)"
+        elif pr == "falling" and sp == "falling":
+            spot_perp = "broad-based selling — spot AND perp CVD falling"
+        else:
+            spot_perp = f"mixed (perp {pr} / spot {sp})"
+
+    def line(label, m):
+        if m is None:
+            return f"  {label}: n/a (not listed / no taker data)"
+        div_note = "" if m["divergence"] == "none" else f", ⚠ {m['divergence']} divergence"
+        taker = f"{m['taker_ratio']:.2f}x" if m["taker_ratio"] is not None else "n/a"
+        return (f"  {label}: CVD {m['cvd']:+.0f} ({m['cvd_trend']}{div_note}) "
+                f"| taker {taker} | price {m['price_change_pct']:+.2f}%")
+
+    summary_lines = [f"{symbol} {interval} order flow ({limit} bars):", line("Perp", perp), line("Spot", spot)]
+    if spot_perp:
+        summary_lines.append(f"  → spot-vs-perp: {spot_perp}")
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "perp": perp,
+        "spot": spot,
+        "spot_vs_perp": spot_perp,
         "summary": "\n".join(summary_lines),
     }
 
@@ -586,6 +686,64 @@ def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 
 
     result["summary"] = summary
     return result
+
+
+@mcp.tool()
+def get_squeeze(symbol: str, interval: str = "1h", limit: int = 100, period: int = 20) -> dict:
+    """Volatility-regime / breakout-timing filter: TTM-style squeeze + Bollinger width.
+
+    A squeeze is ON when the Bollinger Bands sit inside the Keltner Channels — a
+    low-volatility coil that often precedes an expansion. Bollinger Band Width (BBW)
+    and its percentile vs recent history gauge compression. NON-directional: it tells
+    you a move is loading, not which way — pair with get_cvd / get_regime for direction.
+
+    symbol:   pair like 'BTCUSDT' — quote in USDT.
+    interval: candle interval (default 1h). limit: candles to fetch (default 100).
+    period:   Bollinger/Keltner lookback (default 20).
+
+    Returns squeeze_on, BBW + percentile + state (compressed/normal/expanded), the
+    Bollinger and Keltner band levels, and a summary. ~half of squeezes fail or give
+    small moves — require a confirmation trigger before acting.
+    """
+    symbol = symbol.upper()
+    limit = _clamp_limit(limit)
+    try:
+        candles = sources.fetch_klines(symbol, interval, limit)
+    except Exception as e:
+        return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
+
+    sq = detect_squeeze(candles, period=period)
+    if sq is None:
+        return {"error": f"need at least {period + 1} candles, got {len(candles)}"}
+
+    current_close = float(candles[-1][4])
+    pctile = sq["bbw_pctile"]
+    pctile_str = "n/a" if pctile is None else f"{pctile:.0f}th pct"
+    summary = (
+        f"{symbol} {interval} | squeeze: {'ON (coiled — expansion likely)' if sq['squeeze_on'] else 'off'} "
+        f"| BBW {sq['bbw']:.4f} ({sq['state']}, {pctile_str}) "
+        f"| BB [{sq['bb_lower']:.6g}, {sq['bb_upper']:.6g}] | KC [{sq['kc_lower']:.6g}, {sq['kc_upper']:.6g}]"
+    )
+
+    def r(x, ndigits):
+        return None if x is None else round(x, ndigits)
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "period": period,
+        "current_close": current_close,
+        "squeeze_on": sq["squeeze_on"],
+        "bbw": r(sq["bbw"], 6),
+        "bbw_pctile": r(pctile, 2),
+        "state": sq["state"],
+        "bb_upper": sq["bb_upper"],
+        "bb_mid": sq["bb_mid"],
+        "bb_lower": sq["bb_lower"],
+        "kc_upper": sq["kc_upper"],
+        "kc_lower": sq["kc_lower"],
+        "summary": summary,
+    }
 
 
 @mcp.tool()

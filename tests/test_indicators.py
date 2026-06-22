@@ -14,13 +14,21 @@ from indicators import (  # noqa: E402
     calc_ema, calc_atr, calc_vwap, calc_adx, calc_obv, calc_volume_ratio,
     calc_volume_profile, analyze_orderbook, calc_fibs, compute_indicators,
     classify_regime, classify_oi_price, classify_long_short, position_size,
+    calc_cvd, calc_taker_ratio, cvd_divergence, calc_bollinger, detect_squeeze,
     LS_EXTREME_LONG, LS_EXTREME_SHORT,
 )
 
 
 def candle(t, o, h, l, c, v):
-    """Binance kline shape: [openTime, open, high, low, close, volume]."""
+    """Binance kline shape (first 6 fields): [openTime, open, high, low, close, volume]."""
     return [t, o, h, l, c, v]
+
+
+def fcandle(t, c, vol, taker_buy, h=None, l=None):
+    """Full 12-field kline with taker-buy base volume at index 9 (open=close=c)."""
+    h = c if h is None else h
+    l = c if l is None else l
+    return [t, c, h, l, c, vol, t + 1, vol * c, 1, taker_buy, taker_buy * c, "0"]
 
 
 # --- calc_ema -------------------------------------------------------------
@@ -193,7 +201,122 @@ def test_calc_fibs_zero_range():
 def test_compute_indicators_shape():
     candles = [candle(i, i, i + 1, i, i + 0.5, 1) for i in range(40)]
     out = compute_indicators(candles)
-    assert set(out) == {"obv", "obv_trend", "volume_ratio", "adx", "plus_di", "minus_di"}
+    assert set(out) == {
+        "obv", "obv_trend", "volume_ratio", "adx", "plus_di", "minus_di",
+        "cvd", "cvd_trend", "cvd_divergence", "taker_ratio",
+        "squeeze_on", "bbw", "bbw_state",
+    }
+    # 6-field candles carry no taker volume → CVD/taker degrade gracefully
+    assert out["cvd"] is None and out["cvd_trend"] == "n/a"
+    assert out["taker_ratio"] is None
+    # squeeze only needs high/low/close, so it still computes
+    assert isinstance(out["squeeze_on"], bool)
+
+
+# --- calc_cvd -------------------------------------------------------------
+
+def test_calc_cvd_rising():
+    # each candle: total=10, taker_buy=8 → delta = 2*8-10 = +6; CVD climbs
+    candles = [fcandle(i, 100, 10, 8) for i in range(6)]
+    cvd, trend = calc_cvd(candles)
+    assert cvd == pytest.approx(36.0)
+    assert trend == "rising"
+
+
+def test_calc_cvd_falling():
+    candles = [fcandle(i, 100, 10, 2) for i in range(6)]   # delta = 2*2-10 = -6
+    cvd, trend = calc_cvd(candles)
+    assert cvd == pytest.approx(-36.0)
+    assert trend == "falling"
+
+
+def test_calc_cvd_none_on_truncated_rows():
+    candles = [candle(i, 1, 1, 1, 1, 10) for i in range(5)]   # 6-field, no taker field
+    assert calc_cvd(candles) == (None, "n/a")
+
+
+# --- calc_taker_ratio -----------------------------------------------------
+
+def test_calc_taker_ratio_basic():
+    # total=10, taker_buy=6 → taker_sell=4 → ratio 1.5
+    candles = [fcandle(i, 100, 10, 6) for i in range(4)]
+    assert calc_taker_ratio(candles) == pytest.approx(1.5)
+
+
+def test_calc_taker_ratio_none_without_taker():
+    candles = [candle(i, 1, 1, 1, 1, 10) for i in range(4)]
+    assert calc_taker_ratio(candles) is None
+
+
+# --- cvd_divergence -------------------------------------------------------
+
+def test_cvd_divergence_bearish():
+    # price rising (closes 100..105) but CVD falling (taker_buy < half of total)
+    candles = [fcandle(i, 100 + i, 10, 2) for i in range(6)]
+    d = cvd_divergence(candles)
+    assert d["price_trend"] == "rising"
+    assert d["cvd_trend"] == "falling"
+    assert d["divergence"] == "bearish"
+
+
+def test_cvd_divergence_bullish():
+    # price falling but CVD rising → absorption/accumulation
+    candles = [fcandle(i, 105 - i, 10, 8) for i in range(6)]
+    d = cvd_divergence(candles)
+    assert d["price_trend"] == "falling"
+    assert d["cvd_trend"] == "rising"
+    assert d["divergence"] == "bullish"
+
+
+def test_cvd_divergence_none_when_aligned():
+    candles = [fcandle(i, 100 + i, 10, 8) for i in range(6)]   # price up, CVD up
+    assert cvd_divergence(candles)["divergence"] == "none"
+
+
+# --- calc_bollinger -------------------------------------------------------
+
+def test_calc_bollinger_constant_series_zero_width():
+    bb = calc_bollinger([100.0] * 20, period=20)
+    assert bb["mid"] == pytest.approx(100.0)
+    assert bb["upper"] == pytest.approx(100.0)
+    assert bb["lower"] == pytest.approx(100.0)
+    assert bb["bbw"] == pytest.approx(0.0)
+
+
+def test_calc_bollinger_known_values():
+    # last 20 = ten 1s + ten 3s → mid 2, population sd 1, ±2σ → [0,4], bbw 2
+    bb = calc_bollinger([1.0] * 10 + [3.0] * 10, period=20, mult=2.0)
+    assert bb["mid"] == pytest.approx(2.0)
+    assert bb["upper"] == pytest.approx(4.0)
+    assert bb["lower"] == pytest.approx(0.0)
+    assert bb["bbw"] == pytest.approx(2.0)
+
+
+def test_calc_bollinger_none_too_few():
+    assert calc_bollinger([1, 2, 3], period=20) is None
+
+
+# --- detect_squeeze -------------------------------------------------------
+
+def test_detect_squeeze_on_when_compressed():
+    # flat closes (BB collapses) but real high/low range (ATR>0) → BB inside KC
+    candles = [fcandle(i, 100, 10, 5, h=101, l=99) for i in range(25)]
+    sq = detect_squeeze(candles, period=20)
+    assert sq is not None
+    assert sq["squeeze_on"] is True
+
+
+def test_detect_squeeze_off_when_expanded():
+    # wide close dispersion (big BB) with tight per-bar range (small ATR) → BB outside KC
+    candles = [fcandle(i, 100 + i, 10, 5, h=100 + i + 0.5, l=100 + i - 0.5) for i in range(25)]
+    sq = detect_squeeze(candles, period=20)
+    assert sq is not None
+    assert sq["squeeze_on"] is False
+
+
+def test_detect_squeeze_none_too_few():
+    candles = [fcandle(i, 100, 10, 5) for i in range(10)]
+    assert detect_squeeze(candles, period=20) is None
 
 
 # --- classify_regime ------------------------------------------------------

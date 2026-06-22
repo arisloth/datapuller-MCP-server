@@ -41,6 +41,20 @@ def fetch_klines(symbol: str, interval: str, limit: int):
     return r.json()
 
 
+def fetch_klines_spot(symbol: str, interval: str, limit: int):
+    """Spot klines only (no futures fallback) — for spot-vs-perp comparison."""
+    r = SESSION.get(BASE, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_klines_futures(symbol: str, interval: str, limit: int):
+    """USDⓈ-M perpetual klines only — for spot-vs-perp comparison."""
+    r = SESSION.get(f"{FAPI_BASE}/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
 def fetch_orderbook_binance(symbol: str) -> dict:
     r = SESSION.get(DEPTH_BASE, params={"symbol": symbol, "limit": 20}, timeout=TIMEOUT)
     if r.status_code == 400:

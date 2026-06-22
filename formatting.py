@@ -62,6 +62,13 @@ def fmt_indicators(values):
     adx       = values["adx"]
     pdi       = values["plus_di"]
     ndi       = values["minus_di"]
+    cvd          = values.get("cvd")
+    cvd_trend    = values.get("cvd_trend", "n/a")
+    cvd_div      = values.get("cvd_divergence", "none")
+    taker_ratio  = values.get("taker_ratio")
+    squeeze_on   = values.get("squeeze_on")
+    bbw          = values.get("bbw")
+    bbw_state    = values.get("bbw_state")
 
     # ADX as a regime GATE, not a momentum trigger (Plan.md Stage 1 #3):
     # DI direction is only actionable in a trending regime — below ADX_TREND it
@@ -77,11 +84,34 @@ def fmt_indicators(values):
         adx_label = "trending — DI direction actionable"
         bias = f" ({direction})"
 
+    # CVD signs every executed trade by aggressor side — it dominates OBV on perps.
+    if cvd is None:
+        cvd_line = "  CVD: n/a (no taker data) | OBV: " f"{obv:+.0f} ({obv_trend})"
+    else:
+        div_note = "" if cvd_div == "none" else f"  ⚠ {cvd_div} divergence vs price"
+        cvd_line = f"  CVD: {cvd:+.0f} ({cvd_trend}){div_note} | OBV: {obv:+.0f} ({obv_trend})"
+
+    taker_line = (
+        f"  Taker buy/sell: {taker_ratio:.2f}x ({'buy' if taker_ratio > 1 else 'sell'}-side aggression)"
+        if taker_ratio is not None else "  Taker buy/sell: n/a"
+    )
+
+    if squeeze_on is None:
+        squeeze_line = "  Squeeze: n/a"
+    else:
+        bbw_str = f"{bbw:.4f}" if bbw is not None else "n/a"
+        squeeze_line = (
+            f"  Squeeze: {'ON (coiled — expansion likely)' if squeeze_on else 'off'} "
+            f"| BBW {bbw_str} ({bbw_state})"
+        )
+
     return [
         "Indicators:",
-        f"  OBV: {obv:+.0f} ({obv_trend})",
+        cvd_line,
+        taker_line,
         f"  Volume ratio (current / 20-bar avg): {vol_ratio:.2f}x",
         f"  ADX(14): {adx:.1f} [{adx_label}] | +DI: {pdi:.1f} | -DI: {ndi:.1f}{bias}",
+        squeeze_line,
         "  (full regime needs the 200-EMA → use get_regime)",
     ]
 

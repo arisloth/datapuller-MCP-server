@@ -204,11 +204,17 @@ def calc_adx(candles, period=14):
 
 
 def compute_indicators(candles) -> dict:
-    """Bundle OBV(+trend), volume ratio, and ADX/+DI/-DI in one pass so callers
-    compute the math once and formatters render from the result (no recompute)."""
+    """Bundle the per-timeframe indicators in one pass so callers compute the math
+    once and formatters render from the result (no recompute). Includes the Stage-2
+    order-flow context (CVD, taker ratio, squeeze) derived from the same candles;
+    those fields are None / "n/a" when the rows lack taker volume or are too short."""
     obv, obv_trend = calc_obv(candles)
     vol_ratio      = calc_volume_ratio(candles)
     adx, pdi, ndi  = calc_adx(candles)
+    cvd, cvd_trend = calc_cvd(candles)
+    div            = cvd_divergence(candles)
+    taker_ratio    = calc_taker_ratio(candles)
+    sq             = detect_squeeze(candles)
     return {
         "obv": obv,
         "obv_trend": obv_trend,
@@ -216,6 +222,13 @@ def compute_indicators(candles) -> dict:
         "adx": adx,
         "plus_di": pdi,
         "minus_di": ndi,
+        "cvd": cvd,
+        "cvd_trend": cvd_trend,
+        "cvd_divergence": div["divergence"],
+        "taker_ratio": taker_ratio,
+        "squeeze_on": None if sq is None else sq["squeeze_on"],
+        "bbw": None if sq is None else sq["bbw"],
+        "bbw_state": None if sq is None else sq["state"],
     }
 
 
@@ -400,4 +413,152 @@ def position_size(equity, risk_pct, entry, atr, atr_mult) -> dict | None:
         "stop_distance": stop_distance,
         "qty": qty,
         "notional": qty * entry,
+    }
+
+
+# --- Stage 2 order-flow layer ---------------------------------------------
+# CVD and the taker ratio are built from the kline's taker-buy base volume
+# (field index 9), available on both spot and futures klines. No trade tape needed.
+#   per-candle delta = takerBuy - takerSell = 2*takerBuyBase - totalVolume
+# Functions degrade to None / "n/a" when rows lack field 9 (e.g. truncated input).
+
+def _has_taker(candles) -> bool:
+    return bool(candles) and len(candles[0]) > 9
+
+
+def calc_cvd(candles):
+    """Cumulative Volume Delta — running net of taker-buy minus taker-sell volume
+    (aggressor intent). Returns (cvd, trend). Unlike OBV (close-to-close) this
+    signs executed flow; CVD strictly dominates OBV on perps. The absolute value
+    is meaningless (start-point dependent) — read the trend/slope. Returns
+    (None, "n/a") when the kline rows carry no taker-buy field."""
+    if not _has_taker(candles):
+        return None, "n/a"
+    cvd = 0.0
+    series = []
+    for k in candles:
+        total = float(k[5])
+        taker_buy = float(k[9])
+        cvd += 2 * taker_buy - total
+        series.append(cvd)
+
+    n = min(5, len(series) // 2)
+    if n == 0:
+        return cvd, "flat"
+    recent_avg = sum(series[-n:]) / n
+    prior_avg  = sum(series[-2 * n:-n]) / n
+    if recent_avg > prior_avg:
+        trend = "rising"
+    elif recent_avg < prior_avg:
+        trend = "falling"
+    else:
+        trend = "flat"
+    return cvd, trend
+
+
+def calc_taker_ratio(candles, n: int | None = None):
+    """Aggressive order flow: taker-buy ÷ taker-sell volume over the last `n`
+    candles (whole window if None). >1 = buy-side aggression dominating right now.
+    Returns None when taker data is absent or taker-sell volume is zero."""
+    if not _has_taker(candles):
+        return None
+    rows = candles if n is None else candles[-n:]
+    taker_buy = sum(float(k[9]) for k in rows)
+    total     = sum(float(k[5]) for k in rows)
+    taker_sell = total - taker_buy
+    if taker_sell <= 0:
+        return None
+    return taker_buy / taker_sell
+
+
+def cvd_divergence(candles) -> dict:
+    """Coarse slope-based CVD/price divergence (NOT swing-based — read with
+    structure). price up + CVD down => bearish (distribution/exhaustion);
+    price down + CVD up => bullish (absorption/accumulation)."""
+    _, cvd_trend = calc_cvd(candles)
+    if cvd_trend == "n/a":
+        return {"price_trend": "n/a", "cvd_trend": "n/a", "divergence": "none"}
+    closes = [float(k[4]) for k in candles]
+    n = min(5, len(closes) // 2)
+    if n == 0:
+        return {"price_trend": "flat", "cvd_trend": cvd_trend, "divergence": "none"}
+    recent = sum(closes[-n:]) / n
+    prior  = sum(closes[-2 * n:-n]) / n
+    if recent > prior:
+        price_trend = "rising"
+    elif recent < prior:
+        price_trend = "falling"
+    else:
+        price_trend = "flat"
+
+    divergence = "none"
+    if price_trend == "rising" and cvd_trend == "falling":
+        divergence = "bearish"
+    elif price_trend == "falling" and cvd_trend == "rising":
+        divergence = "bullish"
+    return {"price_trend": price_trend, "cvd_trend": cvd_trend, "divergence": divergence}
+
+
+def calc_bollinger(closes, period: int = 20, mult: float = 2.0):
+    """Bollinger Bands over the last `period` closes (SMA mid, population stdev).
+    Returns {mid, upper, lower, bbw} where bbw=(upper-lower)/mid is the normalized
+    band width (volatility/compression gauge). None if too few closes."""
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    mid = sum(window) / period
+    sd = (sum((c - mid) ** 2 for c in window) / period) ** 0.5
+    upper = mid + mult * sd
+    lower = mid - mult * sd
+    bbw = (upper - lower) / mid if mid else 0.0
+    return {"mid": mid, "upper": upper, "lower": lower, "bbw": bbw}
+
+
+def detect_squeeze(candles, period: int = 20, bb_mult: float = 2.0, kc_mult: float = 1.5):
+    """TTM-style volatility squeeze: Bollinger Bands inside Keltner Channels =
+    a low-volatility coil that often precedes expansion. KC = SMA(period) ±
+    kc_mult·ATR(period) (reuses calc_atr). Also reports current BBW and its
+    percentile vs the window's rolling BBW history (compressed/normal/expanded).
+    None if too few candles."""
+    closes = [float(k[4]) for k in candles]
+    if len(closes) < period or len(candles) < period + 1:
+        return None
+    bb = calc_bollinger(closes, period, bb_mult)
+    atr = calc_atr(candles, period)
+    if bb is None or atr is None:
+        return None
+
+    mid = bb["mid"]
+    kc_upper = mid + kc_mult * atr
+    kc_lower = mid - kc_mult * atr
+    squeeze_on = bb["upper"] < kc_upper and bb["lower"] > kc_lower
+
+    # Percentile rank of the current BBW vs its own rolling history.
+    bbws = []
+    for i in range(period, len(closes) + 1):
+        b = calc_bollinger(closes[:i], period, bb_mult)
+        if b is not None:
+            bbws.append(b["bbw"])
+    cur = bb["bbw"]
+    pctile = (sum(1 for x in bbws if x <= cur) / len(bbws) * 100) if len(bbws) > 1 else None
+
+    if pctile is None:
+        state = "n/a"
+    elif pctile <= 25:
+        state = "compressed"
+    elif pctile >= 75:
+        state = "expanded"
+    else:
+        state = "normal"
+
+    return {
+        "squeeze_on": squeeze_on,
+        "bbw": cur,
+        "bbw_pctile": pctile,
+        "bb_upper": bb["upper"],
+        "bb_mid": mid,
+        "bb_lower": bb["lower"],
+        "kc_upper": kc_upper,
+        "kc_lower": kc_lower,
+        "state": state,
     }
