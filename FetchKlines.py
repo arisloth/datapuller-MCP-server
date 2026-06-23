@@ -8,15 +8,16 @@ Usage:
     python FetchKlines.py --clean          # delete all snapshot txt files
     python FetchKlines.py --clean BTCUSDT  # delete only BTCUSDT snapshots
 
-Data fetching, indicator math, and text rendering live in sources.py /
-indicators.py / formatting.py so the MCP server (mcp_server.py) reuses them.
+Data fetching, indicator math, and text rendering live in providers/ /
+services.py / indicators.py / formatting.py so the MCP server (mcp_server.py) reuses them.
 """
 import sys
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
-import sources
+import services
+from providers import binance, bybit, hyperliquid
 from indicators import analyze_orderbook, calc_fibs, calc_adx, calc_ema, calc_atr, classify_regime
 from formatting import fmt_candle, fmt_orderbook, fmt_fibs, fmt_indicators, fmt_futures_context
 
@@ -39,7 +40,7 @@ def regime_lines(symbol: str) -> list:
     rest of the snapshot (trend-following vs mean-reversion vs stand-aside)."""
     lines = ["=== Market Regime (meta-filter) ==="]
     try:
-        candles = sources.fetch_klines(symbol, REGIME_INTERVAL, REGIME_LIMIT)
+        candles = binance.fetch_klines(symbol, REGIME_INTERVAL, REGIME_LIMIT)
     except Exception as e:
         lines.append(f"  N/A ({e})")
         return lines
@@ -94,9 +95,9 @@ def main():
 
     lines.append("=== Order Book Snapshot (top 20 levels) ===")
     for exch_name, fetcher in [
-        ("Binance",      sources.fetch_orderbook_binance),
-        ("Bybit",        sources.fetch_orderbook_bybit),
-        ("Hyperliquid",  sources.fetch_orderbook_hyperliquid),
+        ("Binance",      binance.fetch_orderbook),
+        ("Bybit",        bybit.fetch_orderbook),
+        ("Hyperliquid",  hyperliquid.fetch_orderbook),
     ]:
         try:
             depth = fetcher(symbol)
@@ -105,12 +106,12 @@ def main():
             lines.append(f"  [{exch_name}] N/A ({e})")
     lines.append("")
 
-    lines.extend(fmt_futures_context(sources.compute_futures_context(symbol)))
+    lines.extend(fmt_futures_context(services.compute_futures_context(symbol)))
     lines.append("")
 
     for interval, limit in TIMEFRAMES:
         try:
-            candles = sources.fetch_klines(symbol, interval, limit)
+            candles = binance.fetch_klines(symbol, interval, limit)
         except requests.HTTPError as e:
             lines.append(f"[{interval}] ERROR: {e}")
             lines.append("")

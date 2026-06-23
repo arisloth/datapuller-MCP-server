@@ -1,22 +1,29 @@
-# Binance Data Puller
+# Market Data Puller
 
-Pulls live crypto market data from public exchange APIs (Binance, Bybit, Hyperliquid —
-no API key needed) and serves it two ways:
+Pulls live market data and serves it two ways:
 
 1. **CLI** — `FetchKlines.py` writes a compact multi-timeframe text snapshot to disk.
-2. **MCP server** — `mcp_server.py` exposes the same data as tools an LLM (Claude Desktop /
+2. **MCP server** — `mcp_server.py` exposes the data as tools an LLM (Claude Desktop /
    Claude Code) can call on demand, so every answer reflects current market state.
+
+**Crypto is keyless** (Binance, Bybit, Hyperliquid, Coinbase, CoinGecko — public APIs).
+**Stocks & ETFs** (incl. commodity ETFs like GLD/USO) come from **Alpaca** and need an API
+key in your environment — see [Multi-asset](#multi-asset-stocks--etfs). Commodity *futures*
+are not covered (use ETF proxies).
 
 ## Layout
 
-| File | Role |
-|------|------|
-| `sources.py` | Raw HTTP fetchers, return parsed JSON |
-| `indicators.py` | Pure math — OBV, volume ratio, ADX, EMA/ATR/VWAP, volume profile, order-book imbalance, Fibonacci, the Stage-1 interpretation layer (trend regime, OI/price quadrant, L/S extreme flag, ATR position sizing), the Stage-2 order-flow layer (CVD + divergence, taker buy/sell ratio, Bollinger width / TTM squeeze), the Stage-3 positioning layer (funding APR/extremes, perp basis), the Stage-4 context layer (BTC correlation/beta, market-cap rotation), and confirmation-only candlestick pattern detection |
-| `formatting.py` | Text renderers shared by the CLI and the tool summaries |
-| `FetchKlines.py` | CLI snapshot tool |
-| `mcp_server.py` | MCP (stdio) server exposing the tools |
-| `requirements.txt` | `requests`, `mcp[cli]` |
+Layered so dependencies point downward only — I/O ↘ orchestration ↘ math/presentation ↘ tools:
+
+| Path | Layer | Role |
+|------|-------|------|
+| `providers/` | I/O | One module per source — `binance`, `bybit`, `hyperliquid`, `coinbase`, `coingecko`, `alpaca` (equities), plus `base` (shared pooled HTTP session) and `router` (asset-class dispatch). Pure fetch → parsed JSON / normalized rows; imports nothing from the layers below. |
+| `services.py` | Orchestration | Composes providers + indicators into ready results (`compute_futures_context`). |
+| `indicators.py` | Domain math | Pure functions — OBV, volume ratio, ADX, EMA/ATR/VWAP, volume profile, Fibonacci, trend regime, OI/price quadrant, L/S & funding extremes, perp basis, CVD + divergence, taker ratio, Bollinger/TTM squeeze, BTC correlation/beta + rotation, candlestick patterns. No I/O. |
+| `formatting.py` | Presentation | Text renderers shared by the CLI and tool summaries. No I/O. |
+| `FetchKlines.py` | Delivery | CLI snapshot tool. |
+| `mcp_server.py` | Delivery | MCP (stdio) server exposing the tools. |
+| `requirements.txt` | — | `requests`, `mcp[cli]`, `pytest` |
 
 ## Setup
 
@@ -24,6 +31,31 @@ no API key needed) and serves it two ways:
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
+
+## Multi-asset (stocks & ETFs)
+
+Crypto works out of the box (keyless). To pull **stocks/ETFs** (e.g. `AAPL`, `SPY`, `GLD`),
+set Alpaca credentials in your environment (never commit them):
+
+```bash
+export APCA_API_KEY_ID=your_key
+export APCA_API_SECRET_KEY=your_secret
+export ALPACA_FEED=iex      # default; set 'sip' if you have the paid full-tape subscription
+```
+
+- **Routing is automatic:** a `USDT`-suffixed symbol (`BTCUSDT`) → crypto; anything else
+  (`AAPL`) → equity via Alpaca. Every price tool also takes `asset_class="crypto"|"equity"`
+  to force it.
+- **Equity-capable tools:** `get_klines`, `get_indicators`, `get_emas`, `get_vwap`, `get_atr`,
+  `get_volume_profile`, `get_squeeze`, `get_regime`, `get_patterns`, `get_correlation`
+  (reference defaults to `SPY` for equities).
+- **Crypto-only tools** (return a clean N/A for equities): `get_orderbook`,
+  `get_futures_context`, `get_funding`, `get_cvd`, `get_volume_breakdown`, `get_market_breadth`.
+- **IEX feed caveat:** the free Alpaca feed reports only IEX volume (~2–3% of the tape), so
+  volume-based fields (volume profile/ratio/OBV) are flagged low-confidence for equities; price
+  tools are unaffected. Set `ALPACA_FEED=sip` for full-tape volume.
+- **Not available for equities:** CVD/taker (bars carry no trade side) and commodity *futures*
+  (use ETF proxies like GLD/USO).
 
 ## CLI usage
 
@@ -60,7 +92,9 @@ Each tool returns structured fields **plus** a `summary` text block, and returns
 | `get_correlation` | `symbol`, `interval="1h"`, `limit=200`, `btc="BTCUSDT"` | Rolling **correlation + beta** of an alt vs BTC, a recent-half correlation with a **decoupling** flag, and a gating read (high corr → trade BTC's regime; low → alt-specific edge valid) |
 | `get_market_breadth` | _(none)_ | Total market cap + 24h change, TOTAL2 (ex-BTC), BTC/ETH/stablecoin **dominance** with BTC.D direction, ETH/BTC bellwether, and a **rotation read** (btc-dominant / alt-rotation / risk-off) for higher-timeframe alt bias |
 
-`symbol` is a pair like `BTCUSDT`, `ETHUSDT`, `ZECUSDT` (quote in USDT).
+`symbol` is a crypto pair like `BTCUSDT`, `ETHUSDT` (quote in USDT) or — for the equity-capable
+tools — a stock/ETF ticker like `AAPL`, `SPY`, `GLD` (needs Alpaca creds; see
+[Multi-asset](#multi-asset-stocks--etfs)).
 
 ### Try it interactively
 

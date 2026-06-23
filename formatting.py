@@ -3,7 +3,7 @@ Text renderers. Turn raw candles / structured analysis into the human-readable
 lines used by both the CLI snapshot and the MCP tool `summary` fields.
 
 These functions do NO network or heavy computation: callers pass in already
-fetched/computed data (see sources.compute_futures_context, indicators.compute_indicators).
+fetched/computed data (see services.compute_futures_context, indicators.compute_indicators).
 """
 from datetime import datetime, timezone
 
@@ -167,11 +167,11 @@ def fmt_market_breadth(m):
 
 
 def fmt_futures_context(ctx):
-    """Render the futures-context lines from a sources.compute_futures_context()
+    """Render the futures-context lines from a services.compute_futures_context()
     dict (passing a symbol string is still accepted and triggers one fetch)."""
     if not isinstance(ctx, dict):
-        import sources
-        ctx = sources.compute_futures_context(ctx)
+        import services
+        ctx = services.compute_futures_context(ctx)
 
     symbol = ctx["symbol"]
     lines = ["=== Futures Market Context ==="]

@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-import sources
+import services
+from providers import binance, bybit, hyperliquid, coinbase, coingecko, alpaca, router
 from indicators import (
     analyze_orderbook, compute_indicators, calc_fibs, calc_ema,
     calc_vwap, calc_atr, calc_volume_profile, calc_adx,
@@ -31,10 +32,23 @@ from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_cont
 mcp = FastMCP("binance-data")
 
 ORDERBOOK_FETCHERS = {
-    "binance":     sources.fetch_orderbook_binance,
-    "bybit":       sources.fetch_orderbook_bybit,
-    "hyperliquid": sources.fetch_orderbook_hyperliquid,
+    "binance":     binance.fetch_orderbook,
+    "bybit":       bybit.fetch_orderbook,
+    "hyperliquid": hyperliquid.fetch_orderbook,
 }
+
+# Crypto-derivatives signals have no equity equivalent — tools reject equity symbols cleanly.
+def _equity_na(symbol: str, signal: str) -> dict | None:
+    if router.resolve_asset_class(symbol) == "equity":
+        return {"error": f"N/A for equities ({symbol}) — {signal} is a crypto-derivatives signal"}
+    return None
+
+
+def _equity_volume_caveat(symbol: str, asset_class) -> str:
+    """Note appended to volume-bearing summaries when equity data is on the partial IEX feed."""
+    if router.resolve_asset_class(symbol, asset_class) == "equity" and alpaca.feed() != "sip":
+        return "\n  ⚠ volume low-confidence (Alpaca IEX feed is partial volume; SIP gives full tape)"
+    return ""
 
 MAX_LIMIT = 1000
 
@@ -49,12 +63,14 @@ def _clamp_limit(limit: int, lo: int = 1, hi: int = MAX_LIMIT) -> int:
 
 
 @mcp.tool()
-def get_klines(symbol: str, interval: str = "1h", limit: int = 50) -> dict:
-    """Fetch recent OHLCV candles for a trading pair.
+def get_klines(symbol: str, interval: str = "1h", limit: int = 50, asset_class: str | None = None) -> dict:
+    """Fetch recent OHLCV candles for a crypto pair or a stock/ETF.
 
-    symbol:   pair like 'BTCUSDT', 'ETHUSDT', 'ZECUSDT' (quote in USDT).
-    interval: one of 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M.
+    symbol:   crypto pair like 'BTCUSDT' (quote in USDT) OR a stock/ETF ticker like
+              'AAPL', 'SPY', 'GLD' (via Alpaca — needs APCA_API_KEY_ID/SECRET env vars).
+    interval: one of 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M (Alpaca lacks 3d).
     limit:    number of candles (1-1000).
+    asset_class: 'crypto' | 'equity' | None (auto: USDT-suffix → crypto, else equity).
 
     Returns `columns` (the row field order) and `candles` as compact
     [time, open, high, low, close, volume] rows, the percent change over the
@@ -63,7 +79,7 @@ def get_klines(symbol: str, interval: str = "1h", limit: int = 50) -> dict:
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        raw = sources.fetch_klines(symbol, interval, limit)
+        raw = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -102,6 +118,9 @@ def get_orderbook(symbol: str, exchange: str = "binance") -> dict:
     ratio, and a buy/sell/neutral pressure label, plus a text summary.
     """
     symbol = symbol.upper()
+    na = _equity_na(symbol, "order book depth")
+    if na:
+        return na
     exchange = exchange.lower()
     fetcher = ORDERBOOK_FETCHERS.get(exchange)
     if fetcher is None:
@@ -147,8 +166,11 @@ def get_futures_context(symbol: str) -> dict:
     are null when the symbol has no perp or an endpoint is unavailable.
     """
     symbol = symbol.upper()
+    na = _equity_na(symbol, "perp funding/OI/basis context")
+    if na:
+        return na
     # Fetch all futures endpoints exactly once, then format from the same data.
-    ctx = sources.compute_futures_context(symbol)
+    ctx = services.compute_futures_context(symbol)
     summary = "\n".join(fmt_futures_context(ctx))
 
     next_funding = ctx["next_funding"]
@@ -205,18 +227,21 @@ def get_funding(symbol: str) -> dict:
     null when the symbol isn't listed there.
     """
     symbol = symbol.upper()
+    na = _equity_na(symbol, "perp funding")
+    if na:
+        return na
 
-    binance = None
+    bnb = None
     try:
-        pm = sources.fetch_premium_index(symbol)
+        pm = binance.fetch_premium_index(symbol)
         rate = float(pm["lastFundingRate"])
-        hist = sources.fetch_funding_history(symbol, limit=100)
+        hist = binance.fetch_funding_history(symbol, limit=100)
         interval_h = infer_funding_interval_hours(hist)
         apr = annualize_funding(rate, interval_h)
         apr_hist = [annualize_funding(float(h["fundingRate"]), interval_h) for h in hist]
         pct = percentile_rank(apr, apr_hist)
         cls = classify_funding(apr)
-        binance = {
+        bnb = {
             "rate_pct": round(rate * 100, 6), "interval_hours": interval_h,
             "apr": round(apr, 2), "percentile": None if pct is None else round(pct, 1),
             "reading": cls["reading"], "contrarian": cls["contrarian"], "note": cls["note"],
@@ -228,22 +253,22 @@ def get_funding(symbol: str) -> dict:
         apr = annualize_funding(rate, interval_h)
         return {"rate_pct": round(rate * 100, 6), "interval_hours": interval_h, "apr": round(apr, 2)}
 
-    bybit = None
+    byb = None
     try:
-        bybit = simple_venue(float(sources.fetch_bybit_ticker(symbol)["fundingRate"]), 8.0)
+        byb = simple_venue(float(bybit.fetch_ticker(symbol)["fundingRate"]), 8.0)
     except Exception:
         pass
 
     hyper = None
     try:
-        hyper = simple_venue(float(sources.fetch_hyperliquid_ctx(symbol)["funding"]), 1.0)
+        hyper = simple_venue(float(hyperliquid.fetch_ctx(symbol)["funding"]), 1.0)
     except Exception:
         pass
 
-    if binance is None and bybit is None and hyper is None:
+    if bnb is None and byb is None and hyper is None:
         return {"error": f"no funding data for {symbol} on any venue"}
 
-    aprs = {name: v["apr"] for name, v in (("Binance", binance), ("Bybit", bybit), ("Hyperliquid", hyper)) if v}
+    aprs = {name: v["apr"] for name, v in (("Binance", bnb), ("Bybit", byb), ("Hyperliquid", hyper)) if v}
     spread = round(max(aprs.values()) - min(aprs.values()), 2) if len(aprs) >= 2 else None
 
     def vline(name, v):
@@ -256,17 +281,17 @@ def get_funding(symbol: str) -> dict:
         return f"  {name}: {v['apr']:+.1f}% APR ({v['rate_pct']:+.4f}%/{v['interval_hours']:g}h){extra}"
 
     summary_lines = [f"{symbol} cross-exchange funding (annualized):",
-                     vline("Binance", binance), vline("Bybit", bybit), vline("Hyperliquid", hyper)]
+                     vline("Binance", bnb), vline("Bybit", byb), vline("Hyperliquid", hyper)]
     if spread is not None:
         flag = " — wide divergence (positioning/arb)" if spread >= 20 else " — aligned"
         summary_lines.append(f"  Spread: {spread:.1f}% APR{flag}")
-    if binance and binance["note"]:
-        summary_lines.append(f"  → {binance['note']}")
+    if bnb and bnb["note"]:
+        summary_lines.append(f"  → {bnb['note']}")
 
     return {
         "symbol": symbol,
-        "binance": binance,
-        "bybit": bybit,
+        "binance": bnb,
+        "bybit": byb,
         "hyperliquid": hyper,
         "apr_spread": spread,
         "summary": "\n".join(summary_lines),
@@ -274,22 +299,24 @@ def get_funding(symbol: str) -> dict:
 
 
 @mcp.tool()
-def get_indicators(symbol: str, interval: str = "1h", limit: int = 60) -> dict:
-    """Compute technical indicators for a pair over a timeframe.
+def get_indicators(symbol: str, interval: str = "1h", limit: int = 60, asset_class: str | None = None) -> dict:
+    """Compute technical indicators for a crypto pair or stock/ETF over a timeframe.
 
-    symbol:   pair like 'BTCUSDT' — quote in USDT.
+    symbol:   crypto pair like 'BTCUSDT', or a stock/ETF ticker like 'AAPL', 'SPY'.
     interval: candle interval (e.g. 15m, 1h, 4h, 1d). limit: candles to analyze.
+    asset_class: 'crypto' | 'equity' | None (auto).
 
     Returns OBV (+trend), CVD (+trend & price divergence), taker buy/sell ratio,
     volume ratio vs 20-bar average, ADX(14) with +DI/-DI (regime-gated), a TTM
-    squeeze flag with Bollinger band width, and Fibonacci retracement levels of the
-    window's swing, plus a text summary. (CVD/taker are null if the rows carry no
-    taker data; for spot-vs-perp CVD divergence use get_cvd.)
+    squeeze flag with Bollinger band width, candlestick patterns, and Fibonacci
+    retracement levels, plus a text summary. CVD/taker are null for equities (bars
+    carry no taker side); for spot-vs-perp CVD divergence use get_cvd (crypto only).
+    Volume-based fields are low-confidence for equities on Alpaca's free IEX feed.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -299,6 +326,7 @@ def get_indicators(symbol: str, interval: str = "1h", limit: int = 60) -> dict:
     summary_lines = fmt_indicators(ind)
     summary_lines.append("Fibonacci retracements (swing high → low):")
     summary_lines += fmt_fibs(fibs)
+    summary = "\n".join(summary_lines) + _equity_volume_caveat(symbol, asset_class)
 
     def r(x, ndigits):
         return None if x is None else round(x, ndigits)
@@ -321,7 +349,7 @@ def get_indicators(symbol: str, interval: str = "1h", limit: int = 60) -> dict:
         "bbw_state": ind["bbw_state"],
         "patterns": ind["patterns"],
         "fibs": fibs,
-        "summary": "\n".join(summary_lines),
+        "summary": summary,
     }
 
 
@@ -344,6 +372,9 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     higher-conviction accumulation. Degrades to a single market when one is unlisted.
     """
     symbol = symbol.upper()
+    na = _equity_na(symbol, "CVD / taker order flow")
+    if na:
+        return na
     limit = _clamp_limit(limit)
 
     def market_cvd(fetcher):
@@ -369,8 +400,8 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
             "price_change_pct": round(price_chg, 2),
         }
 
-    perp = market_cvd(sources.fetch_klines_futures)
-    spot = market_cvd(sources.fetch_klines_spot)
+    perp = market_cvd(binance.fetch_klines_futures)
+    spot = market_cvd(binance.fetch_klines_spot)
     if perp is None and spot is None:
         return {"error": f"no spot or perp kline/taker data for {symbol} {interval}"}
 
@@ -412,7 +443,7 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
 
 
 @mcp.tool()
-def get_patterns(symbol: str, interval: str = "1h", limit: int = 192) -> dict:
+def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_class: str | None = None) -> dict:
     """Candlestick patterns on the latest bar — CONFIRMATION-ONLY, never standalone signals.
 
     Candle patterns are low-edge alone (like Fibonacci). This tool detects them AND scores
@@ -431,7 +462,7 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192) -> dict:
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
     if not candles:
@@ -481,7 +512,7 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192) -> dict:
 
 
 @mcp.tool()
-def get_emas(symbol: str, interval: str = "1h", limit: int = 500) -> dict:
+def get_emas(symbol: str, interval: str = "1h", limit: int = 500, asset_class: str | None = None) -> dict:
     """Compute 20/50/200 EMAs and the trend stack for a pair.
 
     symbol:   pair like 'BTCUSDT' — quote in USDT.
@@ -496,7 +527,7 @@ def get_emas(symbol: str, interval: str = "1h", limit: int = 500) -> dict:
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -535,7 +566,7 @@ def get_emas(symbol: str, interval: str = "1h", limit: int = 500) -> dict:
 
 
 @mcp.tool()
-def get_regime(symbol: str, interval: str = "4h", limit: int = 300) -> dict:
+def get_regime(symbol: str, interval: str = "4h", limit: int = 300, asset_class: str | None = None) -> dict:
     """Classify the trend regime — the meta-filter that should gate every other signal.
 
     Combines ADX(14) strength with price position vs the 200-EMA to decide which
@@ -557,7 +588,7 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300) -> dict:
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -600,32 +631,37 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300) -> dict:
 
 
 @mcp.tool()
-def get_correlation(symbol: str, interval: str = "1h", limit: int = 200, btc: str = "BTCUSDT") -> dict:
-    """Rolling correlation + beta of an alt vs BTC — tells you *when* alt-specific
-    analysis is even worth doing.
+def get_correlation(symbol: str, interval: str = "1h", limit: int = 200,
+                    reference: str | None = None, asset_class: str | None = None) -> dict:
+    """Rolling correlation + beta of a symbol vs a reference — tells you *when*
+    symbol-specific analysis is even worth doing.
 
-    High correlation (>=0.8) means the alt is just leveraged BTC beta: trade BTC's
-    regime, not alt specifics. A genuine drop in correlation = the alt is decoupling on
-    idiosyncratic flow, and only then do alt-specific setups carry independent edge.
+    High correlation (>=0.8) means the symbol is just leveraged beta of the reference:
+    trade the reference's regime, not the specifics. A genuine drop in correlation =
+    decoupling on idiosyncratic flow, and only then do symbol-specific setups carry edge.
 
-    symbol:   alt pair like 'SOLUSDT' — quote in USDT.
+    symbol:   pair like 'SOLUSDT' or a stock/ETF like 'AAPL'.
     interval: candle interval (default 1h). limit: candles to correlate (default 200).
-    btc:      BTC reference pair (default 'BTCUSDT').
+    reference: benchmark to correlate against. Defaults to BTCUSDT for crypto, SPY for equities.
+    asset_class: 'crypto' | 'equity' | None (auto) — applied to both legs.
 
     Returns Pearson correlation + beta over the window, a recent-half correlation and a
-    `decoupling` flag (recent ≪ full), and a gating read. corr=beta=1.0 for BTC itself.
+    `decoupling` flag (recent ≪ full), and a gating read. corr=beta=1.0 vs itself.
     """
     symbol = symbol.upper()
-    btc = btc.upper()
+    cls_asset = router.resolve_asset_class(symbol, asset_class)
+    if reference is None:
+        reference = "BTCUSDT" if cls_asset == "crypto" else "SPY"
+    reference = reference.upper()
     limit = _clamp_limit(limit)
-    if symbol == btc:
-        return {"symbol": symbol, "interval": interval, "btc": btc, "correlation": 1.0,
+    if symbol == reference:
+        return {"symbol": symbol, "interval": interval, "reference": reference, "correlation": 1.0,
                 "beta": 1.0, "recent_correlation": 1.0, "decoupling": False, "level": "self",
-                "summary": f"{symbol} is the BTC reference — correlation 1.0 by definition."}
+                "summary": f"{symbol} is the reference — correlation 1.0 by definition."}
 
     try:
-        alt = sources.fetch_klines(symbol, interval, limit)
-        ref = sources.fetch_klines(btc, interval, limit)
+        alt = router.fetch_ohlcv(symbol, interval, limit, asset_class)
+        ref = router.fetch_ohlcv(reference, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines: {e}"}
 
@@ -647,14 +683,14 @@ def get_correlation(symbol: str, interval: str = "1h", limit: int = 200, btc: st
 
     rstr = "n/a" if r is None else f"{r:.2f}"
     bstr = "n/a" if bta is None else f"{bta:.2f}"
-    summary = (f"{symbol} vs {btc} ({interval}, {n} bars): corr {rstr} [{cls['level']}], beta {bstr}"
+    summary = (f"{symbol} vs {reference} ({interval}, {n} bars): corr {rstr} [{cls['level']}], beta {bstr}"
                f"{' | ⚠ decoupling (recent corr ' + format(r_recent, '.2f') + ')' if decoupling else ''}"
                f"\n  → {cls['note']}")
 
     return {
         "symbol": symbol,
         "interval": interval,
-        "btc": btc,
+        "reference": reference,
         "correlation": rnd(r, 4),
         "recent_correlation": rnd(r_recent, 4),
         "beta": rnd(bta, 4),
@@ -686,7 +722,7 @@ def get_market_breadth() -> dict:
     }
 
     try:
-        g = sources.fetch_global_metrics()
+        g = coingecko.fetch_global_metrics()
         m["total_mcap_usd"] = round(g["total_market_cap"]["usd"])
         m["total_cap_change_24h_pct"] = round(g["market_cap_change_percentage_24h_usd"], 2)
         mc = g["market_cap_percentage"]
@@ -703,14 +739,14 @@ def get_market_breadth() -> dict:
         return {"error": "failed to fetch global market metrics"}
 
     try:
-        m["btc_24h_pct"] = round(float(sources.fetch_24h_binance("BTCUSDT")["priceChangePercent"]), 2)
+        m["btc_24h_pct"] = round(float(binance.fetch_24h("BTCUSDT")["priceChangePercent"]), 2)
         if m["total_cap_change_24h_pct"] is not None:
             m["btc_dom_rising"] = m["btc_24h_pct"] > m["total_cap_change_24h_pct"]
     except Exception:
         pass
 
     try:
-        m["ethbtc_24h_pct"] = round(float(sources.fetch_24h_binance("ETHBTC")["priceChangePercent"]), 2)
+        m["ethbtc_24h_pct"] = round(float(binance.fetch_24h("ETHBTC")["priceChangePercent"]), 2)
     except Exception:
         pass
 
@@ -758,6 +794,9 @@ def get_volume_breakdown(symbol: str) -> dict:
       - `thin=true` → treat orderbook/funding signals with caution.
     """
     symbol = symbol.upper()
+    na = _equity_na(symbol, "cross-venue crypto volume breakdown")
+    if na:
+        return na
     if symbol.endswith("USDT"):
         base = symbol[:-4]
     elif symbol.endswith("USD"):
@@ -783,29 +822,29 @@ def get_volume_breakdown(symbol: str) -> dict:
     }
 
     try:
-        bnb = sources.fetch_24h_binance(symbol)
+        bnb = binance.fetch_24h(symbol)
         result["binance_volume_usd"] = round(float(bnb["quoteVolume"]), 2)
     except Exception:
         pass
 
     try:
-        fut = sources.fetch_24h_futures(symbol)
+        fut = binance.fetch_24h_futures(symbol)
         result["binance_perp_volume_usd"] = round(float(fut["quoteVolume"]), 2)
     except Exception:
         pass
 
     try:
-        result["bybit_perp_volume_usd"] = round(float(sources.fetch_bybit_ticker(symbol)["turnover24h"]), 2)
+        result["bybit_perp_volume_usd"] = round(float(bybit.fetch_ticker(symbol)["turnover24h"]), 2)
     except Exception:
         pass
 
     try:
-        result["hyperliquid_perp_volume_usd"] = round(float(sources.fetch_hyperliquid_ctx(symbol)["dayNtlVlm"]), 2)
+        result["hyperliquid_perp_volume_usd"] = round(float(hyperliquid.fetch_ctx(symbol)["dayNtlVlm"]), 2)
     except Exception:
         pass
 
     try:
-        cb = sources.fetch_24h_coinbase(base)
+        cb = coinbase.fetch_24h(base)
         cb_vol = float(cb["volume"])
         cb_last = float(cb["last"]) if cb.get("last") else None
         if cb_last is not None:
@@ -814,7 +853,7 @@ def get_volume_breakdown(symbol: str) -> dict:
         pass
 
     try:
-        result["aggregate_volume_usd"] = round(sources.fetch_aggregate_volume(base, quote="USD"), 2)
+        result["aggregate_volume_usd"] = round(coingecko.fetch_aggregate_volume(base, quote="USD"), 2)
     except Exception:
         pass
 
@@ -867,7 +906,7 @@ def get_volume_breakdown(symbol: str) -> dict:
 
 
 @mcp.tool()
-def get_vwap(symbol: str, interval: str = "5m", limit: int = 288) -> dict:
+def get_vwap(symbol: str, interval: str = "5m", limit: int = 288, asset_class: str | None = None) -> dict:
     """Session VWAP (resets at 00:00 UTC) + window VWAP, with 1σ/2σ bands.
 
     symbol:   pair like 'BTCUSDT'.
@@ -884,7 +923,7 @@ def get_vwap(symbol: str, interval: str = "5m", limit: int = 288) -> dict:
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -953,7 +992,7 @@ def get_vwap(symbol: str, interval: str = "5m", limit: int = 288) -> dict:
 @mcp.tool()
 def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 14,
             account_equity: float | None = None, risk_pct: float = 1.0,
-            stop_atr_mult: float = 1.5) -> dict:
+            stop_atr_mult: float = 1.5, asset_class: str | None = None) -> dict:
     """ATR(period) for stop placement and ATR-normalized position sizing — NOT a
     directional signal.
 
@@ -974,7 +1013,7 @@ def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -1025,7 +1064,7 @@ def get_atr(symbol: str, interval: str = "30m", limit: int = 100, period: int = 
 
 
 @mcp.tool()
-def get_squeeze(symbol: str, interval: str = "1h", limit: int = 100, period: int = 20) -> dict:
+def get_squeeze(symbol: str, interval: str = "1h", limit: int = 100, period: int = 20, asset_class: str | None = None) -> dict:
     """Volatility-regime / breakout-timing filter: TTM-style squeeze + Bollinger width.
 
     A squeeze is ON when the Bollinger Bands sit inside the Keltner Channels — a
@@ -1044,7 +1083,7 @@ def get_squeeze(symbol: str, interval: str = "1h", limit: int = 100, period: int
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -1083,7 +1122,7 @@ def get_squeeze(symbol: str, interval: str = "1h", limit: int = 100, period: int
 
 
 @mcp.tool()
-def get_volume_profile(symbol: str, interval: str = "15m", limit: int = 192, bins: int = 24) -> dict:
+def get_volume_profile(symbol: str, interval: str = "15m", limit: int = 192, bins: int = 24, asset_class: str | None = None) -> dict:
     """Price-binned volume profile → POC (point of control), value area (70%),
     and top high-volume nodes. Use to put entries at HVNs (support) not LVN air.
 
@@ -1098,7 +1137,7 @@ def get_volume_profile(symbol: str, interval: str = "15m", limit: int = 192, bin
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
     try:
-        candles = sources.fetch_klines(symbol, interval, limit)
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
     except Exception as e:
         return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
 
@@ -1118,7 +1157,7 @@ def get_volume_profile(symbol: str, interval: str = "15m", limit: int = 192, bin
     summary = (
         f"{symbol} {interval} ({len(candles)} bars) | POC: {vp['poc']:.6g} "
         f"| VA: [{vp['val']:.6g}, {vp['vah']:.6g}] | close {current_close:.6g} → {loc}"
-    )
+    ) + _equity_volume_caveat(symbol, asset_class)
 
     return {
         "symbol": symbol,
