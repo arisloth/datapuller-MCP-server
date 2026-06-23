@@ -1,10 +1,7 @@
-<<<<<<< HEAD
-# Market Data Puller
-=======
-# Data Puller
->>>>>>> e6565d204a907e5c4beadeee6d754c987a9826d3
+#  Market Data Puller
 
-Pulls live market data and serves it two ways:
+Pulls live crypto market data from public exchange APIs (Binance, Bybit, Hyperliquid —
+no API key needed) and serves it two ways:
 
 1. **CLI** — `FetchKlines.py` writes a compact multi-timeframe text snapshot to disk.
 2. **MCP server** — `mcp_server.py` exposes the data as tools an LLM (Claude Desktop /
