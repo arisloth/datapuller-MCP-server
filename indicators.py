@@ -16,6 +16,9 @@ OI_FLAT_PCT = 0.1        # |change| below this (either axis) => treated as flat 
 FUNDING_EXTREME_APR = 50.0  # |annualized funding| >= this % => overcrowded (~0.046%/8h). Asset-specific.
 CORR_HIGH = 0.8   # alt-vs-BTC corr >= this => "just BTC beta" (trade BTC's regime)
 CORR_LOW  = 0.5   # corr <= this => decoupled enough that alt-specific setups carry edge
+DOJI_BODY_PCT = 0.1      # candle body <= this fraction of range => doji (indecision)
+PIN_WICK_RATIO = 2.0     # dominant wick >= this x body => pin bar (hammer / shooting star)
+MARUBOZU_WICK_PCT = 0.05 # each wick <= this fraction of range => marubozu (full-body conviction)
 
 
 def calc_obv(candles):
@@ -218,6 +221,7 @@ def compute_indicators(candles) -> dict:
     div            = cvd_divergence(candles)
     taker_ratio    = calc_taker_ratio(candles)
     sq             = detect_squeeze(candles)
+    patterns       = detect_candle_patterns(candles)
     return {
         "obv": obv,
         "obv_trend": obv_trend,
@@ -232,6 +236,7 @@ def compute_indicators(candles) -> dict:
         "squeeze_on": None if sq is None else sq["squeeze_on"],
         "bbw": None if sq is None else sq["bbw"],
         "bbw_state": None if sq is None else sq["state"],
+        "patterns": patterns,
     }
 
 
@@ -699,3 +704,91 @@ def classify_rotation(btc_dom_rising, total_cap_change_pct, flat: float = 0.2) -
         return {"read": "risk_off",
                 "note": "BTC.D falling + total cap falling — broad risk-off / 'stablecoin season', not altseason."}
     return {"read": "neutral", "note": "BTC.D easing with flat total cap — no clear rotation."}
+
+
+# --- Candlestick patterns (CONFIRMATION-ONLY layer) -----------------------
+# Standalone candle patterns are low-edge (like Fib). Detect them, but only treat
+# them as confirmation at a level + with order flow agreeing. Pure OHLC math.
+
+
+def detect_candle_patterns(candles) -> list:
+    """Patterns present on the LATEST bar (uses the last 1-2 candles). Returns a
+    list of {pattern, direction} — direction is bullish/bearish/neutral. Empty list
+    when nothing is found or there's too little/degenerate data. NOTE: the latest
+    candle may be in progress; patterns truly confirm on close."""
+    if not candles:
+        return []
+    o = float(candles[-1][1]); h = float(candles[-1][2])
+    l = float(candles[-1][3]); c = float(candles[-1][4])
+    rng = h - l
+    if rng <= 0:
+        return []
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    found = []
+
+    # Doji — tiny body relative to range (indecision). Takes precedence over pin/marubozu.
+    if body <= DOJI_BODY_PCT * rng:
+        found.append({"pattern": "doji", "direction": "neutral"})
+    else:
+        # Marubozu — negligible wicks both ends (strong conviction).
+        if upper <= MARUBOZU_WICK_PCT * rng and lower <= MARUBOZU_WICK_PCT * rng:
+            found.append({"pattern": "marubozu", "direction": "bullish" if c > o else "bearish"})
+        # Hammer — long lower wick, small upper (rejection of lows → bullish).
+        if lower >= PIN_WICK_RATIO * body and upper <= body:
+            found.append({"pattern": "hammer", "direction": "bullish"})
+        # Shooting star — long upper wick, small lower (rejection of highs → bearish).
+        if upper >= PIN_WICK_RATIO * body and lower <= body:
+            found.append({"pattern": "shooting_star", "direction": "bearish"})
+
+    # Two-candle engulfing — current opposite-color body engulfs the prior body.
+    if len(candles) >= 2:
+        po = float(candles[-2][1]); ph = float(candles[-2][2])
+        pl = float(candles[-2][3]); pc = float(candles[-2][4])
+        if c > o and pc < po and c >= po and o <= pc:
+            found.append({"pattern": "bullish_engulfing", "direction": "bullish"})
+        elif c < o and pc > po and o >= pc and c <= po:
+            found.append({"pattern": "bearish_engulfing", "direction": "bearish"})
+        # Inside bar — current range inside the prior range (compression).
+        if h < ph and l > pl:
+            found.append({"pattern": "inside_bar", "direction": "neutral"})
+
+    return found
+
+
+def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level) -> dict:
+    """Whether a directional candle pattern is CONFIRMED by order flow + location.
+    Patterns are confirmation, never standalone triggers."""
+    if direction == "neutral":
+        return {"verdict": "neutral",
+                "note": "indecision / compression — needs a directional trigger; not a signal alone."}
+
+    # Evaluate CVD (primary flow) and taker ratio (per-interval companion) separately,
+    # so genuinely mixed flow isn't mislabeled as confirmation.
+    if direction == "bullish":
+        cvd_agree, cvd_conflict = cvd_trend == "rising", cvd_trend == "falling"
+        taker_agree = taker_ratio is not None and taker_ratio > 1
+        taker_conflict = taker_ratio is not None and taker_ratio < 1
+    else:  # bearish
+        cvd_agree, cvd_conflict = cvd_trend == "falling", cvd_trend == "rising"
+        taker_agree = taker_ratio is not None and taker_ratio < 1
+        taker_conflict = taker_ratio is not None and taker_ratio > 1
+
+    agree = cvd_agree or taker_agree
+    conflict = cvd_conflict or taker_conflict
+
+    if agree and conflict:
+        return {"verdict": "mixed",
+                "note": f"order flow is mixed on the {direction} pattern (CVD and taker disagree) — no clean confirmation."}
+    if conflict:
+        return {"verdict": "conflicting",
+                "note": f"order flow disagrees with the {direction} pattern — treat as a fakeout risk, not confirmation."}
+    if agree and at_level:
+        return {"verdict": "confirmed",
+                "note": f"{direction} pattern at a level with order flow agreeing — valid confirmation (still size on full confluence)."}
+    if agree:
+        return {"verdict": "weak",
+                "note": f"{direction} pattern with order flow agreeing but not at a structural level — weak confirmation."}
+    return {"verdict": "unconfirmed",
+            "note": f"{direction} pattern without order-flow or level support — not confirmation on its own."}

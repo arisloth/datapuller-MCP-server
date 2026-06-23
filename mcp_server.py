@@ -24,6 +24,7 @@ from indicators import (
     classify_funding, classify_basis,
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     CORR_HIGH,
+    detect_candle_patterns, classify_pattern_confirmation,
 )
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context, fmt_market_breadth
 
@@ -318,6 +319,7 @@ def get_indicators(symbol: str, interval: str = "1h", limit: int = 60) -> dict:
         "squeeze_on": ind["squeeze_on"],
         "bbw": r(ind["bbw"], 6),
         "bbw_state": ind["bbw_state"],
+        "patterns": ind["patterns"],
         "fibs": fibs,
         "summary": "\n".join(summary_lines),
     }
@@ -406,6 +408,75 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
         "spot": spot,
         "spot_vs_perp": spot_perp,
         "summary": "\n".join(summary_lines),
+    }
+
+
+@mcp.tool()
+def get_patterns(symbol: str, interval: str = "1h", limit: int = 192) -> dict:
+    """Candlestick patterns on the latest bar — CONFIRMATION-ONLY, never standalone signals.
+
+    Candle patterns are low-edge alone (like Fibonacci). This tool detects them AND scores
+    whether they're confirmed by order flow (CVD slope + taker ratio) and location (at a
+    volume-profile node / value-area edge). A pattern with agreeing flow at a level is a valid
+    confirmation; the same pattern mid-range with conflicting flow is a fakeout risk.
+
+    symbol:   pair like 'BTCUSDT' — quote in USDT.
+    interval: candle interval (default 1h). limit: candles for context (default 192).
+
+    Detects: hammer, shooting_star, doji, marubozu, bullish/bearish_engulfing, inside_bar.
+    Returns each with a verdict (confirmed / weak / mixed / conflicting / unconfirmed / neutral)
+    plus the CVD/taker/level context. The latest candle may be in progress — patterns confirm on
+    close. Pair with get_regime (don't take counter-trend patterns in a strong trend).
+    """
+    symbol = symbol.upper()
+    limit = _clamp_limit(limit)
+    try:
+        candles = sources.fetch_klines(symbol, interval, limit)
+    except Exception as e:
+        return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
+    if not candles:
+        return {"error": "no candles returned"}
+
+    patterns = detect_candle_patterns(candles)
+    _, cvd_trend = calc_cvd(candles)
+    div = cvd_divergence(candles)
+    taker = calc_taker_ratio(candles)
+    close = float(candles[-1][4])
+
+    # at_level: latest close near a volume-profile node / value-area edge (within 0.3%).
+    at_level = False
+    level_note = "no profile"
+    vp = calc_volume_profile(candles)
+    if vp is not None:
+        level_note = f"not at POC/VA (close {close:.6g})"
+        for name, lvl in (("POC", vp["poc"]), ("VAH", vp["vah"]), ("VAL", vp["val"])):
+            if lvl and abs(close - lvl) / lvl <= 0.003:
+                at_level, level_note = True, f"at {name} {lvl:.6g}"
+                break
+
+    enriched = []
+    for p in patterns:
+        conf = classify_pattern_confirmation(p["direction"], cvd_trend, taker, at_level)
+        enriched.append({**p, "verdict": conf["verdict"], "note": conf["note"]})
+
+    taker_str = f"{taker:.2f}x" if taker is not None else "n/a"
+    if enriched:
+        lines = [f"{symbol} {interval} patterns (latest bar; confirms on close):"]
+        lines += [f"  {p['pattern']} ({p['direction']}) → {p['verdict']}: {p['note']}" for p in enriched]
+        lines.append(f"  context: CVD {cvd_trend}, taker {taker_str}, {level_note}")
+    else:
+        lines = [f"{symbol} {interval}: no candlestick pattern on the latest bar."]
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "patterns": enriched,
+        "cvd_trend": cvd_trend,
+        "cvd_divergence": div["divergence"],
+        "taker_ratio": None if taker is None else round(taker, 4),
+        "at_level": at_level,
+        "current_close": close,
+        "summary": "\n".join(lines),
     }
 
 

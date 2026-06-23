@@ -69,6 +69,7 @@ def fmt_indicators(values):
     squeeze_on   = values.get("squeeze_on")
     bbw          = values.get("bbw")
     bbw_state    = values.get("bbw_state")
+    patterns     = values.get("patterns") or []
 
     # ADX as a regime GATE, not a momentum trigger (Plan.md Stage 1 #3):
     # DI direction is only actionable in a trending regime — below ADX_TREND it
@@ -105,6 +106,12 @@ def fmt_indicators(values):
             f"| BBW {bbw_str} ({bbw_state})"
         )
 
+    if patterns:
+        pat_str = ", ".join(f"{p['pattern']} ({p['direction']})" for p in patterns)
+        pattern_line = f"  Patterns: {pat_str} — confirmation-only (needs level + order flow)"
+    else:
+        pattern_line = "  Patterns: none"
+
     return [
         "Indicators:",
         cvd_line,
@@ -112,6 +119,7 @@ def fmt_indicators(values):
         f"  Volume ratio (current / 20-bar avg): {vol_ratio:.2f}x",
         f"  ADX(14): {adx:.1f} [{adx_label}] | +DI: {pdi:.1f} | -DI: {ndi:.1f}{bias}",
         squeeze_line,
+        pattern_line,
         "  (full regime needs the 200-EMA → use get_regime)",
     ]
 

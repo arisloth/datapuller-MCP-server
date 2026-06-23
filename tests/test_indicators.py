@@ -18,6 +18,7 @@ from indicators import (  # noqa: E402
     annualize_funding, infer_funding_interval_hours, percentile_rank,
     classify_funding, classify_basis,
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
+    detect_candle_patterns, classify_pattern_confirmation,
     LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
 )
 
@@ -207,8 +208,9 @@ def test_compute_indicators_shape():
     assert set(out) == {
         "obv", "obv_trend", "volume_ratio", "adx", "plus_di", "minus_di",
         "cvd", "cvd_trend", "cvd_divergence", "taker_ratio",
-        "squeeze_on", "bbw", "bbw_state",
+        "squeeze_on", "bbw", "bbw_state", "patterns",
     }
+    assert isinstance(out["patterns"], list)
     # 6-field candles carry no taker volume → CVD/taker degrade gracefully
     assert out["cvd"] is None and out["cvd_trend"] == "n/a"
     assert out["taker_ratio"] is None
@@ -447,6 +449,89 @@ def test_classify_rotation_alt_rotation():
 def test_classify_rotation_risk_off():
     # BTC.D falling + total cap falling → risk-off
     assert classify_rotation(False, -2.0)["read"] == "risk_off"
+
+
+# --- detect_candle_patterns -----------------------------------------------
+
+def _names(candles):
+    return [p["pattern"] for p in detect_candle_patterns(candles)]
+
+
+def test_detect_hammer():
+    # small body up top, long lower wick, tiny upper wick
+    assert "hammer" in _names([candle(0, 10, 10.3, 9, 10.2, 1)])
+
+
+def test_detect_shooting_star():
+    assert "shooting_star" in _names([candle(0, 10, 11, 9.7, 9.8, 1)])
+
+
+def test_detect_doji():
+    assert "doji" in _names([candle(0, 10, 10.5, 9.5, 10.01, 1)])
+
+
+def test_detect_marubozu():
+    pats = detect_candle_patterns([candle(0, 10, 11, 10, 11, 1)])
+    assert {"pattern": "marubozu", "direction": "bullish"} in pats
+
+
+def test_detect_bullish_engulfing():
+    candles = [candle(0, 10, 10, 9, 9, 1),          # prior: bearish
+               candle(1, 8.9, 10.2, 8.8, 10.1, 1)]  # current: bullish body engulfs prior
+    assert "bullish_engulfing" in _names(candles)
+
+
+def test_detect_bearish_engulfing():
+    candles = [candle(0, 9, 10, 9, 10, 1),
+               candle(1, 10.1, 10.2, 8.8, 8.9, 1)]
+    assert "bearish_engulfing" in _names(candles)
+
+
+def test_detect_inside_bar():
+    candles = [candle(0, 10, 12, 8, 10, 1),         # wide prior bar
+               candle(1, 10, 10.8, 9.5, 10.2, 1)]   # range inside prior
+    assert "inside_bar" in _names(candles)
+
+
+def test_detect_no_pattern():
+    assert detect_candle_patterns([candle(0, 10, 10.7, 9.8, 10.5, 1)]) == []
+
+
+def test_detect_patterns_empty_input():
+    assert detect_candle_patterns([]) == []
+
+
+# --- classify_pattern_confirmation ----------------------------------------
+
+def test_pattern_confirmation_confirmed():
+    r = classify_pattern_confirmation("bullish", "rising", 1.2, at_level=True)
+    assert r["verdict"] == "confirmed"
+
+
+def test_pattern_confirmation_weak_without_level():
+    r = classify_pattern_confirmation("bullish", "rising", 1.2, at_level=False)
+    assert r["verdict"] == "weak"
+
+
+def test_pattern_confirmation_conflicting():
+    r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True)
+    assert r["verdict"] == "conflicting"
+
+
+def test_pattern_confirmation_mixed():
+    # CVD conflicts (falling) but taker agrees (>1) for a bullish pattern → mixed
+    r = classify_pattern_confirmation("bullish", "falling", 1.2, at_level=True)
+    assert r["verdict"] == "mixed"
+
+
+def test_pattern_confirmation_unconfirmed():
+    r = classify_pattern_confirmation("bullish", "flat", None, at_level=False)
+    assert r["verdict"] == "unconfirmed"
+
+
+def test_pattern_confirmation_neutral():
+    r = classify_pattern_confirmation("neutral", "rising", 1.2, at_level=True)
+    assert r["verdict"] == "neutral"
 
 
 # --- classify_regime ------------------------------------------------------
