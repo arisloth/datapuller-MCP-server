@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 # Market Data Puller
+=======
+# Data Puller
+>>>>>>> e6565d204a907e5c4beadeee6d754c987a9826d3
 
 Pulls live market data and serves it two ways:
 
