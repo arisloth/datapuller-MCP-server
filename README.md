@@ -117,8 +117,8 @@ Opens the MCP Inspector in your browser; call each tool and inspect the response
    {
      "mcpServers": {
        "binance-data": {
-         "command": "/Users/arian/Documents/Uni/PP/binancedatapuller/.venv/bin/python",
-         "args": ["/Users/arian/Documents/Uni/PP/binancedatapuller/mcp_server.py"]
+         "command": "/absolute/path/to/binancedatapuller/.venv/bin/python",
+         "args": ["/absolute/path/to/binancedatapuller/mcp_server.py"]
        }
      }
    }
@@ -139,8 +139,8 @@ Opens the MCP Inspector in your browser; call each tool and inspect the response
 
 ```bash
 claude mcp add binance-data -- \
-  /Users/arian/Documents/Uni/PP/binancedatapuller/.venv/bin/python \
-  /Users/arian/Documents/Uni/PP/binancedatapuller/mcp_server.py
+  /absolute/path/to/binancedatapuller/.venv/bin/python \
+  /absolute/path/to/binancedatapuller/mcp_server.py
 ```
 
 ## Notes
