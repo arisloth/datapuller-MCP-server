@@ -29,7 +29,7 @@ from indicators import (
 )
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context, fmt_market_breadth
 
-mcp = FastMCP("binance-data")
+mcp = FastMCP("market-data-mcp")
 
 ORDERBOOK_FETCHERS = {
     "binance":     binance.fetch_orderbook,

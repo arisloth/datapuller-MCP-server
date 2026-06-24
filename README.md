@@ -1,4 +1,4 @@
-#  Market Data Puller
+#  Market Data MCP
 
 Pulls live crypto market data from public exchange APIs (Binance, Bybit, Hyperliquid —
 no API key needed) and serves it two ways:
@@ -116,7 +116,7 @@ Opens the MCP Inspector in your browser; call each tool and inspect the response
    ```json
    {
      "mcpServers": {
-       "binance-data": {
+       "market-data-mcp": {
          "command": "/absolute/path/to/binancedatapuller/.venv/bin/python",
          "args": ["/absolute/path/to/binancedatapuller/mcp_server.py"]
        }
@@ -124,7 +124,7 @@ Opens the MCP Inspector in your browser; call each tool and inspect the response
    }
    ```
 
-   If the file already has other servers, add `"binance-data"` as another key inside the
+   If the file already has other servers, add `"market-data-mcp"` as another key inside the
    existing `mcpServers` object rather than replacing it.
 
 3. **Fully quit and reopen Claude Desktop** (the config is read on startup).
@@ -138,7 +138,7 @@ Opens the MCP Inspector in your browser; call each tool and inspect the response
 ### Use with Claude Code (alternative)
 
 ```bash
-claude mcp add binance-data -- \
+claude mcp add market-data-mcp -- \
   /absolute/path/to/binancedatapuller/.venv/bin/python \
   /absolute/path/to/binancedatapuller/mcp_server.py
 ```
