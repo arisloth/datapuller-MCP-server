@@ -19,6 +19,7 @@ from indicators import (  # noqa: E402
     classify_funding, classify_basis,
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     detect_candle_patterns, classify_pattern_confirmation,
+    classify_confluence,
     LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
 )
 
@@ -562,19 +563,37 @@ def test_classify_regime_range_suppresses_di():
     assert r["di_direction"] is None
 
 
-def test_classify_regime_developing_is_transitional():
+def test_classify_regime_developing_aligned_is_early_trend():
+    # ADX 20-25 with DI lean and 200-EMA side agreeing → tradable at reduced size
     r = classify_regime(adx=22, plus_di=20, minus_di=10, close=110, ema_200=100)
     assert r["adx_state"] == "developing"
     assert r["regime"] == "transitional"
-    assert r["mode"] == "stand-aside"
+    assert r["mode"] == "trend-following"
+    assert r["conviction"] == "reduced"
+
+
+def test_classify_regime_developing_misaligned_is_reduced_range():
+    # ADX 20-25 but DI lean (bullish) disagrees with 200-EMA side (below) →
+    # reduced-size range tactics, not a blanket stand-aside
+    r = classify_regime(adx=22, plus_di=20, minus_di=10, close=90, ema_200=100)
+    assert r["regime"] == "transitional"
+    assert r["mode"] == "mean-reversion"
+    assert r["conviction"] == "reduced"
 
 
 def test_classify_regime_conflicted_when_di_disagrees_with_200ema():
     # strong ADX, +DI dominant, but price BELOW the 200-EMA → conflicted
     r = classify_regime(adx=30, plus_di=30, minus_di=10, close=90, ema_200=100)
     assert r["regime"] == "transitional"
+    assert r["mode"] == "stand-aside"
+    assert r["conviction"] == "none"
     assert r["di_direction"] == "bullish"
     assert r["above_200ema"] is False
+
+
+def test_classify_regime_full_conviction_in_trend_and_range():
+    assert classify_regime(adx=30, plus_di=30, minus_di=10, close=110, ema_200=100)["conviction"] == "full"
+    assert classify_regime(adx=12, plus_di=25, minus_di=10, close=110, ema_200=100)["conviction"] == "full"
 
 
 def test_classify_regime_no_200ema_degrades_gracefully():
@@ -643,3 +662,43 @@ def test_position_size_guards_bad_input():
     assert position_size(0, 1.0, 2000, 50, 2.0) is None
     assert position_size(10000, 1.0, 2000, 0, 2.0) is None
     assert position_size(10000, 0, 2000, 50, 2.0) is None
+
+
+# --- classify_confluence ----------------------------------------------------
+
+def test_confluence_aligned():
+    r = classify_confluence({"regime": "bullish", "cvd": "bullish", "taker": "bullish",
+                             "vwap": "neutral", "funding_extreme": None})
+    assert r["verdict"] == "aligned"
+    assert r["direction"] == "long"
+    assert r["agreeing"] == ["cvd", "regime", "taker"]
+    assert r["opposing"] == []
+    assert "actionable" in r["note"]
+
+
+def test_confluence_aligned_needs_three_votes():
+    # two unopposed agreeing reads → leaning, not a full green light
+    r = classify_confluence({"regime": "bearish", "cvd": "bearish", "vwap": "neutral"})
+    assert r["verdict"] == "leaning"
+    assert r["direction"] == "short"
+
+
+def test_confluence_leaning_with_minority_opposition():
+    r = classify_confluence({"regime": "bullish", "ema_stack": "bullish",
+                             "cvd": "bullish", "taker": "bullish", "vwap": "bearish"})
+    assert r["verdict"] == "leaning"
+    assert r["direction"] == "long"
+    assert r["opposing"] == ["vwap"]
+
+
+def test_confluence_mixed():
+    r = classify_confluence({"regime": "bullish", "cvd": "bearish",
+                             "taker": "bearish", "ema_stack": "bullish"})
+    assert r["verdict"] == "mixed"
+
+
+def test_confluence_no_signal():
+    r = classify_confluence({"regime": "neutral", "cvd": "neutral", "taker": None})
+    assert r["verdict"] == "no_signal"
+    assert r["direction"] is None
+    assert r["neutral"] == ["cvd", "regime"]

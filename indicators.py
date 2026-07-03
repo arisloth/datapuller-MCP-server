@@ -322,35 +322,52 @@ def classify_regime(adx, plus_di, minus_di, close, ema_200) -> dict:
     if adx >= ADX_TREND:
         di_direction = "bullish" if plus_di > minus_di else "bearish"
 
-    # Default: not enough strength to trust a trend → range/transitional.
+    # Conviction grades the environment instead of a binary go/no-go:
+    # 'full' = the playbook applies at normal size, 'reduced' = tradable at
+    # smaller size with the stated condition, 'none' = genuinely no edge.
     if adx_state == "ranging":
-        regime, mode = "range", "mean-reversion"
+        regime, mode, conviction = "range", "mean-reversion", "full"
         playbook = ("Ranging: fade value-area / band edges; suppress breakout & "
                     "EMA/DI crossover signals. DI direction is unreliable here.")
     elif adx_state == "developing":
-        regime, mode = "transitional", "stand-aside"
-        playbook = ("Developing (ADX 20-25): trend not confirmed. Wait for ADX>25 "
-                    "to commit to trend-following, or treat as range for now.")
+        # Trend not confirmed, but 20-25 is tradable at reduced size — grade the
+        # lean by whether tentative DI direction agrees with the 200-EMA side.
+        lean = "bullish" if plus_di > minus_di else "bearish"
+        lean_aligned = above_200 is None or (above_200 if lean == "bullish" else not above_200)
+        regime = "transitional"
+        if lean_aligned:
+            mode, conviction = "trend-following", "reduced"
+            playbook = (f"Developing (ADX 20-25), DI lean and 200-EMA side agree ({lean}): "
+                        "early-trend continuations are valid at reduced size; "
+                        "go full size once ADX clears 25.")
+        else:
+            mode, conviction = "mean-reversion", "reduced"
+            playbook = ("Developing (ADX 20-25), direction unresolved: range tactics "
+                        "at reduced size; commit to trend-following when ADX>25 with "
+                        "DI and the 200-EMA side agreeing.")
     else:  # trending — require ADX, DI and 200-EMA side to agree
         bull = di_direction == "bullish" and (above_200 is None or above_200)
         bear = di_direction == "bearish" and (above_200 is None or not above_200)
         if bull:
-            regime, mode = "trend_up", "trend-following"
+            regime, mode, conviction = "trend_up", "trend-following", "full"
             playbook = ("Uptrend: trade pullback continuations long; suppress "
                         "mean-reversion shorts. Don't fade strength.")
         elif bear:
-            regime, mode = "trend_down", "trend-following"
+            regime, mode, conviction = "trend_down", "trend-following", "full"
             playbook = ("Downtrend: trade pullback continuations short; suppress "
                         "mean-reversion longs. Don't fade weakness.")
         else:
             # Strong ADX but DI direction disagrees with the 200-EMA side.
-            regime, mode = "transitional", "stand-aside"
+            regime, mode, conviction = "transitional", "stand-aside", "none"
             playbook = ("Conflicted: ADX is strong but DI direction and the 200-EMA "
-                        "side disagree (possible reversal/transition). Reduce size.")
+                        "side disagree (possible reversal/transition). Stand aside "
+                        "or size minimal; resolves when price closes back on the DI "
+                        "side of the 200-EMA.")
 
     return {
         "regime": regime,
         "mode": mode,
+        "conviction": conviction,
         "adx_state": adx_state,
         "di_direction": di_direction,
         "above_200ema": above_200,
@@ -680,7 +697,7 @@ def classify_correlation(r) -> dict:
     if r is None:
         return {"level": "n/a", "note": "n/a"}
     if r >= CORR_HIGH:
-        return {"level": "high", "note": "moves as leveraged BTC beta — trade BTC's regime, not alt specifics."}
+        return {"level": "high", "note": "moves as leveraged BTC beta — let BTC's regime set direction; use alt specifics for entries/levels."}
     if r <= -CORR_HIGH:
         return {"level": "inverse", "note": "strongly inverse to BTC — unusual; treat with caution."}
     if r <= CORR_LOW:
@@ -762,7 +779,7 @@ def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level) -
     Patterns are confirmation, never standalone triggers."""
     if direction == "neutral":
         return {"verdict": "neutral",
-                "note": "indecision / compression — needs a directional trigger; not a signal alone."}
+                "note": "indecision / compression — becomes tradable on the breakout side once CVD/taker pick a direction."}
 
     # Evaluate CVD (primary flow) and taker ratio (per-interval companion) separately,
     # so genuinely mixed flow isn't mislabeled as confirmation.
@@ -780,15 +797,71 @@ def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level) -
 
     if agree and conflict:
         return {"verdict": "mixed",
-                "note": f"order flow is mixed on the {direction} pattern (CVD and taker disagree) — no clean confirmation."}
+                "note": f"order flow is mixed on the {direction} pattern (CVD and taker disagree) — wait for them to realign before acting."}
     if conflict:
         return {"verdict": "conflicting",
-                "note": f"order flow disagrees with the {direction} pattern — treat as a fakeout risk, not confirmation."}
+                "note": f"order flow disagrees with the {direction} pattern — fakeout risk; the opposite-side read may be the real signal."}
     if agree and at_level:
         return {"verdict": "confirmed",
-                "note": f"{direction} pattern at a level with order flow agreeing — valid confirmation (still size on full confluence)."}
+                "note": f"{direction} pattern at a level with order flow agreeing — full confirmation. This is the setup the framework exists to catch: act per plan, ATR-sized."}
     if agree:
         return {"verdict": "weak",
-                "note": f"{direction} pattern with order flow agreeing but not at a structural level — weak confirmation."}
+                "note": f"{direction} pattern with agreeing order flow but mid-range — tradable at reduced size if the regime agrees; upgrades to confirmed at a POC/VA edge."}
     return {"verdict": "unconfirmed",
-            "note": f"{direction} pattern without order-flow or level support — not confirmation on its own."}
+            "note": f"{direction} pattern without order-flow or level support — needs CVD/taker agreement to become actionable."}
+
+
+# --- Confluence (the counterweight to per-signal caveats) ------------------
+# Every signal above is framed "not alone"; this is where "together" gets a
+# voice. When independent reads agree, say so as plainly as a risk flag.
+
+CONFLUENCE_ALIGNED_MIN = 3  # unopposed agreeing reads needed for a full 'aligned' verdict
+
+
+def classify_confluence(votes: dict) -> dict:
+    """Aggregate named directional reads into one explicit alignment verdict.
+
+    `votes` maps signal name → 'bullish' | 'bearish' | 'neutral' | None
+    (None = unavailable, excluded). Verdicts:
+      aligned   — >= CONFLUENCE_ALIGNED_MIN reads agree, none oppose: the
+                  methodology's green light. Remaining caveats are sizing
+                  inputs, not reasons to stand aside.
+      leaning   — clear majority one way: reduced-size setup.
+      mixed     — reads genuinely disagree: no edge (standing aside IS the signal).
+      no_signal — every read neutral: nothing loaded, not caution.
+    """
+    cast = {k: v for k, v in votes.items() if v is not None}
+    bull = sorted(k for k, v in cast.items() if v == "bullish")
+    bear = sorted(k for k, v in cast.items() if v == "bearish")
+    neutral = sorted(k for k, v in cast.items() if v == "neutral")
+
+    if not bull and not bear:
+        return {"direction": None, "verdict": "no_signal",
+                "agreeing": [], "opposing": [], "neutral": neutral,
+                "note": "every read is neutral — nothing is loaded either way. "
+                        "That is absence of signal, not a reason for extra caution."}
+
+    if len(bull) >= len(bear):
+        direction, agreeing, opposing = "long", bull, bear
+    else:
+        direction, agreeing, opposing = "short", bear, bull
+
+    if not opposing and len(agreeing) >= CONFLUENCE_ALIGNED_MIN:
+        note = (f"{len(agreeing)} independent reads agree ({direction}: {', '.join(agreeing)}) "
+                f"with none opposing — by this stack's own confluence standard this IS an "
+                f"actionable window. Treat remaining caveats as sizing inputs, not vetoes.")
+        verdict = "aligned"
+    elif len(agreeing) >= 2 * max(len(opposing), 1):
+        note = (f"majority of reads lean {direction} ({len(agreeing)} vs {len(opposing)}"
+                f"{' opposing: ' + ', '.join(opposing) if opposing else ''}) — "
+                f"a reduced-size setup if regime and levels cooperate.")
+        verdict = "leaning"
+    else:
+        note = (f"reads genuinely disagree ({direction} {len(agreeing)} vs {len(opposing)}: "
+                f"{', '.join(opposing)} oppose) — no edge either way. This is the one case "
+                f"where standing aside is the signal, not the default.")
+        verdict = "mixed"
+
+    return {"direction": direction, "verdict": verdict,
+            "agreeing": agreeing, "opposing": opposing, "neutral": neutral,
+            "note": note}
