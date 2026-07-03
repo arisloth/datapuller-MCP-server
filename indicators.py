@@ -811,6 +811,37 @@ def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level) -
             "note": f"{direction} pattern without order-flow or level support — needs CVD/taker agreement to become actionable."}
 
 
+# --- Live-flow ladder shape -------------------------------------------------
+# Compares the per-second signed flow rate of a short window against a long
+# one (e.g. 1m vs 15m of tape CVD). The single-window total can't distinguish
+# a stale burst from building aggression; the rate ratio can.
+
+FLOW_ACCEL_RATIO = 1.5   # short-window rate >= this × long rate → accelerating
+FLOW_FADE_RATIO = 0.5    # short-window rate <= this × long rate → fading
+
+
+def classify_flow_ladder(cvd_short, cvd_long, short_s: float, long_s: float) -> dict | None:
+    """Shape of recent order flow from two ladder rungs. Returns
+    {"state": accelerating|steady|fading|flipping|quiet, "note": ...},
+    or None when either rung is unavailable."""
+    if cvd_short is None or cvd_long is None or not short_s or not long_s:
+        return None
+    r_short = cvd_short / short_s
+    r_long = cvd_long / long_s
+    if r_short == 0 and r_long == 0:
+        return {"state": "quiet", "note": "no net flow on either window"}
+    if r_short * r_long < 0:
+        return {"state": "flipping",
+                "note": "the most recent flow runs against the broader window — absorption or early reversal"}
+    if abs(r_short) >= FLOW_ACCEL_RATIO * abs(r_long):
+        return {"state": "accelerating",
+                "note": "recent flow is stronger than the broader window — aggression building now"}
+    if abs(r_short) <= FLOW_FADE_RATIO * abs(r_long):
+        return {"state": "fading",
+                "note": "recent flow is weaker than the broader window — the push is stale/fading"}
+    return {"state": "steady", "note": "flow rate consistent across windows"}
+
+
 # --- Confluence (the counterweight to per-signal caveats) ------------------
 # Every signal above is framed "not alone"; this is where "together" gets a
 # voice. When independent reads agree, say so as plainly as a risk flag.

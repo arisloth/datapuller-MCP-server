@@ -154,7 +154,7 @@ def test_get_cvd_equity_warming_then_live(monkeypatch):
         warm.ingest_equity_trade("EQ:AAPL", t0 - i * 100, 100.09, 10, conditions=["@"])
     mcp_server = _wire_mcp(monkeypatch, warm)
     r = mcp_server.get_cvd("AAPL")
-    assert r["live"]["cvd"] == pytest.approx(100.0)
+    assert r["live"]["windows"]["5m"]["cvd"] == pytest.approx(100.0)
     assert r["live"]["classification"] == "lee-ready"
     assert "Lee–Ready" in r["summary"]
     assert "IEX" in r["summary"]      # partial-tape caveat on the default feed

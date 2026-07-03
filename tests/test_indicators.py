@@ -19,7 +19,7 @@ from indicators import (  # noqa: E402
     classify_funding, classify_basis,
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     detect_candle_patterns, classify_pattern_confirmation,
-    classify_confluence,
+    classify_confluence, classify_flow_ladder,
     LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
 )
 
@@ -702,3 +702,35 @@ def test_confluence_no_signal():
     assert r["verdict"] == "no_signal"
     assert r["direction"] is None
     assert r["neutral"] == ["cvd", "regime"]
+
+
+# --- classify_flow_ladder ----------------------------------------------------
+
+def test_flow_ladder_accelerating():
+    # 1m rate = 20/60; 15m rate = 60/900 → short is 5x long → accelerating
+    r = classify_flow_ladder(20.0, 60.0, 60, 900)
+    assert r["state"] == "accelerating"
+
+
+def test_flow_ladder_fading():
+    # 1m rate = 1/60; 15m rate = 90/900 → short is 0.17x long → fading
+    r = classify_flow_ladder(1.0, 90.0, 60, 900)
+    assert r["state"] == "fading"
+
+
+def test_flow_ladder_steady():
+    # equal per-second rates → steady
+    r = classify_flow_ladder(6.0, 90.0, 60, 900)
+    assert r["state"] == "steady"
+
+
+def test_flow_ladder_flipping():
+    # recent selling against broader buying → flipping (absorption/reversal)
+    r = classify_flow_ladder(-10.0, 90.0, 60, 900)
+    assert r["state"] == "flipping"
+
+
+def test_flow_ladder_quiet_and_none():
+    assert classify_flow_ladder(0.0, 0.0, 60, 900)["state"] == "quiet"
+    assert classify_flow_ladder(None, 90.0, 60, 900) is None
+    assert classify_flow_ladder(10.0, None, 60, 900) is None

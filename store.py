@@ -149,7 +149,9 @@ class TapeStore:
              _now_ms: int | None = None) -> dict | None:
         """Signed order flow over the trailing window (whole tape if None):
         {cvd, taker_ratio, buy_vol, sell_vol, n_trades, from_ms, to_ms}.
-        Unsided trades are excluded. None when no sided trades are in window."""
+        Unsided trades are excluded. None when no sided trades are in window.
+        Assumes trades were ingested in chronological order (live-stream tape) —
+        the window scan walks backward and stops at the first out-of-window ts."""
         t = self.tape(key)
         cutoff = None
         if window_s is not None:
@@ -209,12 +211,14 @@ class TapeStore:
             }
 
     def age_s(self, key: str, _now_ms: int | None = None) -> float | None:
-        """Seconds since the last event on this tape. None if never touched."""
+        """Seconds since the last event on this tape. None if never touched.
+        Clamped at 0 — venue timestamps can run slightly ahead of local time."""
         t = self.tape(key)
         with t.lock:
             if t.last_event_ms is None:
                 return None
-            return ((_now_ms if _now_ms is not None else now_ms()) - t.last_event_ms) / 1000
+            age = ((_now_ms if _now_ms is not None else now_ms()) - t.last_event_ms) / 1000
+            return max(0.0, age)
 
     def is_warm(self, key: str) -> bool:
         """Enough trades to aggregate meaningfully. Freshness is reported

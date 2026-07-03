@@ -34,8 +34,9 @@ from indicators import (
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     CORR_HIGH,
     detect_candle_patterns, classify_pattern_confirmation,
-    classify_confluence,
+    classify_confluence, classify_flow_ladder,
 )
+from store import now_ms
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context, fmt_market_breadth
 
 mcp = FastMCP("market-data-mcp")
@@ -72,7 +73,55 @@ def _equity_volume_caveat(symbol: str, asset_class) -> str:
     return ""
 
 MAX_LIMIT = 1000
-LIVE_WINDOW_S = 300  # trailing window for stream-based (trade-level) flow reads
+# Ladder of trailing windows for stream-based (trade-level) flow reads. The
+# comparison across rungs is the signal: 1m vs 15m rate → building or fading.
+LIVE_WINDOWS = (("1m", 60), ("5m", 300), ("15m", 900))
+LIVE_SHAPE_MIN_COVERAGE = 0.75  # longest rung must span this share of its window
+
+
+def _live_flow(key: str) -> dict | None:
+    """Ladder read of a tape: per-rung {cvd, taker_ratio, n_trades} plus a
+    shape label (1m rate vs 15m rate). None when the tape has no sided trades.
+    Shape is withheld ('warming') until the 15m rung actually spans most of
+    its window — a freshly subscribed tape would otherwise skew the rates."""
+    rungs = {}
+    for label, secs in LIVE_WINDOWS:
+        f = STORE.flow(key, window_s=secs)
+        rungs[label] = None if f is None else {
+            "cvd": round(f["cvd"], 4),
+            "taker_ratio": None if f["taker_ratio"] is None else round(f["taker_ratio"], 4),
+            "n_trades": f["n_trades"],
+        }
+    if all(r is None for r in rungs.values()):
+        return None
+
+    shape = None
+    long_label, long_s = LIVE_WINDOWS[-1]
+    short_label, short_s = LIVE_WINDOWS[0]
+    f_long = STORE.flow(key, window_s=long_s)
+    if f_long is not None:
+        coverage_s = (now_ms() - f_long["from_ms"]) / 1000
+        if coverage_s >= LIVE_SHAPE_MIN_COVERAGE * long_s:
+            cvd_short = rungs[short_label]["cvd"] if rungs[short_label] else 0.0
+            shape = classify_flow_ladder(cvd_short, f_long["cvd"], short_s, long_s)
+
+    age = STORE.age_s(key)
+    return {
+        "windows": rungs,
+        "shape": None if shape is None else shape["state"],
+        "shape_note": None if shape is None else shape["note"],
+        "data_age_s": None if age is None else round(age, 1),
+    }
+
+
+def _fmt_ladder(m: dict) -> str:
+    """One compact summary fragment: '1m +12 | 5m +48 | 15m +51 (fading)'."""
+    bits = []
+    for label, _secs in LIVE_WINDOWS:
+        r = m["windows"][label]
+        bits.append(f"{label} n/a" if r is None else f"{label} {r['cvd']:+.4g}")
+    shape = f" ({m['shape']})" if m["shape"] else ""
+    return " | ".join(bits) + shape
 
 
 def _clamp_limit(limit: int, lo: int = 1, hi: int = MAX_LIMIT) -> int:
@@ -427,9 +476,11 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     strong perp CVD but weak spot CVD is leverage-led and fragile; spot-led CVD is
     higher-conviction accumulation. Degrades to a single market when one is unlisted.
     Also returns `live`: trade-level flow from the WebSocket tape (true aggressor
-    side per print, 5-minute trailing window) for perp and spot.
+    side per print) as a 1m/5m/15m window ladder per market, with a `shape` label
+    (accelerating / steady / fading / flipping / quiet) comparing the 1m vs 15m
+    flow rate — building aggression vs a stale burst vs absorption.
 
-    Equities: live CVD/taker ratio from the Alpaca stream, each print classified
+    Equities: the same live ladder from the Alpaca stream, each print classified
     via Lee–Ready (1991) against the prevailing NBBO (bars carry no taker side, so
     this is stream-only). Needs Alpaca creds and an open US market.
 
@@ -442,28 +493,15 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
         if err:
             return err
         feed = alpaca.feed()
-        key = f"EQ:{symbol}"
-        f = STORE.flow(key, window_s=LIVE_WINDOW_S)
-        if f is None:
+        live = _live_flow(f"EQ:{symbol}")
+        if live is None:
             return {"symbol": symbol, "asset_class": "equity", "live": None,
                     "summary": (f"{symbol}: equity flow tape warming (subscribed on this call — retry "
                                 f"in a few seconds; needs an open US market; feed={feed})")}
-        age = STORE.age_s(key)
-        live = {
-            "cvd": round(f["cvd"], 2),
-            "taker_ratio": None if f["taker_ratio"] is None else round(f["taker_ratio"], 4),
-            "buy_vol": round(f["buy_vol"], 2),
-            "sell_vol": round(f["sell_vol"], 2),
-            "n_trades": f["n_trades"],
-            "window_s": LIVE_WINDOW_S,
-            "data_age_s": None if age is None else round(age, 1),
-            "source": f"stream/{feed}",
-            "classification": "lee-ready",
-        }
-        taker_str = f"{live['taker_ratio']:.2f}x" if live["taker_ratio"] is not None else "n/a"
-        summary = (f"{symbol} equity order flow (last {LIVE_WINDOW_S // 60}m, Lee–Ready-classified "
-                   f"{feed} tape): CVD {live['cvd']:+.0f} shares | taker {taker_str} "
-                   f"| {live['n_trades']} prints")
+        live["source"] = f"stream/{feed}"
+        live["classification"] = "lee-ready"
+        summary = (f"{symbol} equity order flow (CVD ladder in shares, Lee–Ready-classified "
+                   f"{feed} tape): {_fmt_ladder(live)}")
         if feed != "sip":
             summary += IEX_TAPE_CAVEAT
         return {"symbol": symbol, "asset_class": "equity", "live": live, "summary": summary}
@@ -523,20 +561,12 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     # Live tape: trade-level flow with the true aggressor side per print —
     # finer than the kline approximation above. First call subscribes (warming).
     stream_manager.ensure_subscribed_crypto(symbol)
-    live = {"window_s": LIVE_WINDOW_S, "source": "stream", "perp": None, "spot": None}
+    live = {"source": "stream", "perp": None, "spot": None}
     for market in ("perp", "spot"):
-        key = f"{market.upper()}:{symbol}"
-        f = STORE.flow(key, window_s=LIVE_WINDOW_S)
-        if f is None:
-            continue
-        age = STORE.age_s(key)
-        live[market] = {
-            "cvd": round(f["cvd"], 4),
-            "taker_ratio": None if f["taker_ratio"] is None else round(f["taker_ratio"], 4),
-            "n_trades": f["n_trades"],
-            "data_age_s": None if age is None else round(age, 1),
-            "venue": stream_manager.PERP_VENUE if market == "perp" else stream_manager.SPOT_VENUE,
-        }
+        m = _live_flow(f"{market.upper()}:{symbol}")
+        if m is not None:
+            m["venue"] = stream_manager.PERP_VENUE if market == "perp" else stream_manager.SPOT_VENUE
+        live[market] = m
 
     def live_line():
         if live["perp"] is None and live["spot"] is None:
@@ -544,12 +574,8 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
         bits = []
         for market in ("perp", "spot"):
             m = live[market]
-            if m is None:
-                bits.append(f"{market} n/a")
-                continue
-            taker = f"{m['taker_ratio']:.2f}x" if m["taker_ratio"] is not None else "n/a"
-            bits.append(f"{market} CVD {m['cvd']:+.4g} (taker {taker}, {m['n_trades']} trades)")
-        return f"  live tape ({LIVE_WINDOW_S // 60}m, true aggressor side): " + " | ".join(bits)
+            bits.append(f"{market} n/a" if m is None else f"{market}: {_fmt_ladder(m)}")
+        return "  live tape (CVD ladder, true aggressor side): " + "  ||  ".join(bits)
 
     summary_lines = [f"{symbol} {interval} order flow ({limit} bars):", line("Perp", perp), line("Spot", spot)]
     if spot_perp:

@@ -188,7 +188,8 @@ def test_get_cvd_live_fields(monkeypatch):
     assert r["live"]["perp"] is None and r["live"]["spot"] is None
     assert "warming" in r["summary"]
 
-    # warm store → live fields present
+    # warm store → live ladder present (all trades within the last 5s, so every
+    # rung holds them all; 15m coverage too short for a shape read yet)
     warm = TapeStore()
     now_ms = __import__("store").now_ms()
     for i in range(5):
@@ -196,7 +197,35 @@ def test_get_cvd_live_fields(monkeypatch):
         warm.ingest_trade("SPOT:BTCUSDT", now_ms - i * 1000, 100.0, 1.0, "sell")
     monkeypatch.setattr(mcp_server, "STORE", warm)
     r = mcp_server.get_cvd("BTCUSDT")
-    assert r["live"]["perp"]["cvd"] == pytest.approx(10.0)
-    assert r["live"]["spot"]["cvd"] == pytest.approx(-5.0)
-    assert r["live"]["perp"]["n_trades"] == 5
+    for rung in ("1m", "5m", "15m"):
+        assert r["live"]["perp"]["windows"][rung]["cvd"] == pytest.approx(10.0)
+        assert r["live"]["spot"]["windows"][rung]["cvd"] == pytest.approx(-5.0)
+    assert r["live"]["perp"]["windows"]["1m"]["n_trades"] == 5
+    assert r["live"]["perp"]["shape"] is None      # coverage gate: tape too young
     assert "live tape" in r["summary"]
+
+
+def test_get_cvd_live_shape_when_covered(monkeypatch):
+    import mcp_server
+    from store import now_ms
+
+    def fake_klines(symbol, interval, limit):
+        return [[1_700_000_000_000, "100", "101", "99", "100.5", "10", 0, 0, 0, "6"]]
+
+    monkeypatch.setattr(mcp_server.binance, "fetch_klines_futures", fake_klines)
+    monkeypatch.setattr(mcp_server.binance, "fetch_klines_spot", fake_klines)
+    monkeypatch.setattr(mcp_server.stream_manager, "ensure_subscribed_crypto", lambda s: None)
+
+    warm = TapeStore()
+    t0 = now_ms()
+    # chronological ingest, like a live stream: steady buying across the full
+    # 15m window, then a heavy burst in the last minute → accelerating
+    for i in range(29, -1, -1):
+        warm.ingest_trade("PERP:BTCUSDT", t0 - i * 30_000, 100.0, 1.0, "buy")
+    for i in range(9, -1, -1):
+        warm.ingest_trade("PERP:BTCUSDT", t0 - i * 1000, 100.0, 5.0, "buy")
+    monkeypatch.setattr(mcp_server, "STORE", warm)
+
+    r = mcp_server.get_cvd("BTCUSDT")
+    assert r["live"]["perp"]["shape"] == "accelerating"
+    assert "(accelerating)" in r["summary"]
