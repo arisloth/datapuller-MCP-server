@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"classify_pattern_confirmation,$\\\\|^\\)\" /Users/arian/Documents/Uni/PP/binancedatapuller/tests/test_indicators.py)"
+    ]
+  }
+}

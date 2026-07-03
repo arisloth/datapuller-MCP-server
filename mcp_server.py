@@ -8,6 +8,12 @@ Or interactively with the MCP Inspector:
 
 Each tool returns structured fields PLUS a human-readable `summary` string, and
 returns {"error": "..."} on failure instead of raising, so the model can react.
+
+Role note for the model: these tools report setup quality — the trader makes the
+final call. Per-signal caveats mean "not alone", never "never": they are sizing
+inputs, not vetoes. When independent signals align (see get_confluence), state
+that as plainly as you would flag a risk; "stand aside" is a positive claim that
+no edge exists right now, not a safe default answer.
 """
 import math
 from datetime import datetime, timezone
@@ -16,6 +22,8 @@ from mcp.server.fastmcp import FastMCP
 
 import services
 from providers import binance, bybit, hyperliquid, coinbase, coingecko, alpaca, router
+from store import STORE
+from streams import manager as stream_manager
 from indicators import (
     analyze_orderbook, compute_indicators, calc_fibs, calc_ema,
     calc_vwap, calc_atr, calc_volume_profile, calc_adx,
@@ -26,6 +34,7 @@ from indicators import (
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     CORR_HIGH,
     detect_candle_patterns, classify_pattern_confirmation,
+    classify_confluence,
 )
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context, fmt_market_breadth
 
@@ -44,6 +53,18 @@ def _equity_na(symbol: str, signal: str) -> dict | None:
     return None
 
 
+def _equity_stream_start(symbol: str) -> dict | None:
+    """Kick off the equity stream subscription; error dict when creds are missing."""
+    try:
+        stream_manager.ensure_subscribed_equity(symbol)
+    except ValueError as e:
+        return {"error": str(e)}
+    return None
+
+
+IEX_TAPE_CAVEAT = "\n  ⚠ IEX feed is a partial tape — read flow direction, not magnitude (ALPACA_FEED=sip for full tape)"
+
+
 def _equity_volume_caveat(symbol: str, asset_class) -> str:
     """Note appended to volume-bearing summaries when equity data is on the partial IEX feed."""
     if router.resolve_asset_class(symbol, asset_class) == "equity" and alpaca.feed() != "sip":
@@ -51,6 +72,7 @@ def _equity_volume_caveat(symbol: str, asset_class) -> str:
     return ""
 
 MAX_LIMIT = 1000
+LIVE_WINDOW_S = 300  # trailing window for stream-based (trade-level) flow reads
 
 
 def _clamp_limit(limit: int, lo: int = 1, hi: int = MAX_LIMIT) -> int:
@@ -109,18 +131,48 @@ def get_klines(symbol: str, interval: str = "1h", limit: int = 50, asset_class: 
 
 @mcp.tool()
 def get_orderbook(symbol: str, exchange: str = "binance") -> dict:
-    """Fetch the top-20 order book and its bid/ask imbalance.
+    """Fetch the top-20 order book and its bid/ask imbalance (crypto), or the
+    live NBBO top-of-book quote (equities, via the Alpaca stream).
 
-    symbol:   pair like 'BTCUSDT' (Bybit/Binance) — quote in USDT.
-    exchange: 'binance', 'bybit', or 'hyperliquid'.
+    symbol:   pair like 'BTCUSDT' (quote in USDT) or a stock/ETF like 'AAPL'.
+    exchange: 'binance', 'bybit', or 'hyperliquid' (ignored for equities).
 
-    Returns best bid/ask, spread, and per-depth (5/10/20 level) bid vs ask volume,
+    Crypto: best bid/ask, spread, and per-depth (5/10/20 level) bid vs ask volume,
     ratio, and a buy/sell/neutral pressure label, plus a text summary.
+    Equities: best bid/ask with sizes, spread, and quote age — top-of-book NBBO
+    only, not L2 depth. First call on a symbol subscribes the stream and reports
+    warming; needs an open US market to tick.
     """
     symbol = symbol.upper()
-    na = _equity_na(symbol, "order book depth")
-    if na:
-        return na
+    if router.resolve_asset_class(symbol) == "equity":
+        err = _equity_stream_start(symbol)
+        if err:
+            return err
+        feed = alpaca.feed()
+        q = STORE.quote(f"EQ:{symbol}")
+        if q is None:
+            return {"symbol": symbol, "asset_class": "equity",
+                    "summary": (f"{symbol}: NBBO quote warming (subscribed on this call — retry in a "
+                                f"few seconds; needs an open US market; feed={feed})")}
+        age = STORE.age_s(f"EQ:{symbol}")
+        return {
+            "symbol": symbol,
+            "asset_class": "equity",
+            "exchange": f"alpaca/{feed}",
+            "best_bid": q["bid"],
+            "best_ask": q["ask"],
+            "bid_size": q["bid_size"],
+            "ask_size": q["ask_size"],
+            "mid": q["mid"],
+            "spread": round(q["spread"], 6),
+            "spread_pct": None if q["spread_pct"] is None else round(q["spread_pct"], 6),
+            "data_age_s": None if age is None else round(age, 1),
+            "summary": (f"{symbol} NBBO ({feed}): "
+                        f"{q['bid']} x {q['bid_size'] if q['bid_size'] is not None else '?'} bid / "
+                        f"{q['ask']} x {q['ask_size'] if q['ask_size'] is not None else '?'} ask "
+                        f"| spread {q['spread']:.4f} ({q['spread_pct']:.4f}%) "
+                        f"— top-of-book only, not L2 depth"),
+        }
     exchange = exchange.lower()
     fetcher = ORDERBOOK_FETCHERS.get(exchange)
     if fetcher is None:
@@ -214,10 +266,11 @@ def get_futures_context(symbol: str) -> dict:
 def get_funding(symbol: str) -> dict:
     """Cross-exchange funding (Binance / Bybit / Hyperliquid), normalized to APR.
 
-    Funding is a positioning/sentiment read, NOT a timing trigger — it has ~zero
-    single-asset predictive power and can stay extreme for weeks in a strong trend.
-    Use APR extremes as a contrarian flag and cross-exchange divergence as a
-    positioning / arbitrage signal.
+    Funding is a positioning/sentiment read, not a standalone timing trigger — it
+    has weak single-asset predictive power and can stay extreme for weeks in a
+    strong trend. Use APR extremes as a contrarian flag and cross-exchange
+    divergence as a positioning / arbitrage signal; a funding extreme that agrees
+    with other reads (see get_confluence) strengthens the setup.
 
     symbol: perpetual like 'BTCUSDT'.
 
@@ -309,8 +362,9 @@ def get_indicators(symbol: str, interval: str = "1h", limit: int = 60, asset_cla
     Returns OBV (+trend), CVD (+trend & price divergence), taker buy/sell ratio,
     volume ratio vs 20-bar average, ADX(14) with +DI/-DI (regime-gated), a TTM
     squeeze flag with Bollinger band width, candlestick patterns, and Fibonacci
-    retracement levels, plus a text summary. CVD/taker are null for equities (bars
-    carry no taker side); for spot-vs-perp CVD divergence use get_cvd (crypto only).
+    retracement levels, plus a text summary. CVD/taker are null for equities here
+    (bars carry no taker side) — use get_cvd for equity flow (live Lee–Ready tape)
+    and for crypto spot-vs-perp CVD divergence.
     Volume-based fields are low-confidence for equities on Alpaca's free IEX feed.
     """
     symbol = symbol.upper()
@@ -358,23 +412,61 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     """Cumulative Volume Delta on perp + spot, with spot-vs-perp divergence.
 
     CVD is the running net of taker-buy minus taker-sell volume (aggressor intent),
-    built from kline taker-buy volume — impossible to spoof, unlike order-book depth.
+    built from kline taker-buy volume — printed trades, so far harder to fake than
+    resting order-book depth (wash trading can still inflate it on thin pairs).
     The absolute value is meaningless (start-point dependent): read the trend, the
     CVD-vs-price divergence, and especially the SPOT-vs-PERP split.
 
-    symbol:   pair like 'BTCUSDT' — quote in USDT.
+    symbol:   pair like 'BTCUSDT' (quote in USDT) or a stock/ETF like 'AAPL'.
     interval: candle interval (default 15m; keep >=1m — sub-minute CVD is HFT/wash noise).
-    limit:    candles to analyze (default 96 = 24h of 15m bars).
+    limit:    candles to analyze (default 96 = 24h of 15m bars). Both are crypto-only;
+              the equity read is a streaming 5-minute window.
 
-    Returns per-market (perp & spot) CVD, trend, taker buy/sell ratio, price change,
+    Crypto: per-market (perp & spot) CVD, trend, taker buy/sell ratio, price change,
     and a coarse CVD-vs-price divergence flag, plus a spot-vs-perp read: a rally on
     strong perp CVD but weak spot CVD is leverage-led and fragile; spot-led CVD is
     higher-conviction accumulation. Degrades to a single market when one is unlisted.
+    Also returns `live`: trade-level flow from the WebSocket tape (true aggressor
+    side per print, 5-minute trailing window) for perp and spot.
+
+    Equities: live CVD/taker ratio from the Alpaca stream, each print classified
+    via Lee–Ready (1991) against the prevailing NBBO (bars carry no taker side, so
+    this is stream-only). Needs Alpaca creds and an open US market.
+
+    The first call on a symbol subscribes and reports "warming" — live fields fill
+    in within a few seconds and stay live for the rest of the session.
     """
     symbol = symbol.upper()
-    na = _equity_na(symbol, "CVD / taker order flow")
-    if na:
-        return na
+    if router.resolve_asset_class(symbol) == "equity":
+        err = _equity_stream_start(symbol)
+        if err:
+            return err
+        feed = alpaca.feed()
+        key = f"EQ:{symbol}"
+        f = STORE.flow(key, window_s=LIVE_WINDOW_S)
+        if f is None:
+            return {"symbol": symbol, "asset_class": "equity", "live": None,
+                    "summary": (f"{symbol}: equity flow tape warming (subscribed on this call — retry "
+                                f"in a few seconds; needs an open US market; feed={feed})")}
+        age = STORE.age_s(key)
+        live = {
+            "cvd": round(f["cvd"], 2),
+            "taker_ratio": None if f["taker_ratio"] is None else round(f["taker_ratio"], 4),
+            "buy_vol": round(f["buy_vol"], 2),
+            "sell_vol": round(f["sell_vol"], 2),
+            "n_trades": f["n_trades"],
+            "window_s": LIVE_WINDOW_S,
+            "data_age_s": None if age is None else round(age, 1),
+            "source": f"stream/{feed}",
+            "classification": "lee-ready",
+        }
+        taker_str = f"{live['taker_ratio']:.2f}x" if live["taker_ratio"] is not None else "n/a"
+        summary = (f"{symbol} equity order flow (last {LIVE_WINDOW_S // 60}m, Lee–Ready-classified "
+                   f"{feed} tape): CVD {live['cvd']:+.0f} shares | taker {taker_str} "
+                   f"| {live['n_trades']} prints")
+        if feed != "sip":
+            summary += IEX_TAPE_CAVEAT
+        return {"symbol": symbol, "asset_class": "equity", "live": live, "summary": summary}
     limit = _clamp_limit(limit)
 
     def market_cvd(fetcher):
@@ -428,9 +520,41 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
         return (f"  {label}: CVD {m['cvd']:+.0f} ({m['cvd_trend']}{div_note}) "
                 f"| taker {taker} | price {m['price_change_pct']:+.2f}%")
 
+    # Live tape: trade-level flow with the true aggressor side per print —
+    # finer than the kline approximation above. First call subscribes (warming).
+    stream_manager.ensure_subscribed_crypto(symbol)
+    live = {"window_s": LIVE_WINDOW_S, "source": "stream", "perp": None, "spot": None}
+    for market in ("perp", "spot"):
+        key = f"{market.upper()}:{symbol}"
+        f = STORE.flow(key, window_s=LIVE_WINDOW_S)
+        if f is None:
+            continue
+        age = STORE.age_s(key)
+        live[market] = {
+            "cvd": round(f["cvd"], 4),
+            "taker_ratio": None if f["taker_ratio"] is None else round(f["taker_ratio"], 4),
+            "n_trades": f["n_trades"],
+            "data_age_s": None if age is None else round(age, 1),
+            "venue": stream_manager.PERP_VENUE if market == "perp" else stream_manager.SPOT_VENUE,
+        }
+
+    def live_line():
+        if live["perp"] is None and live["spot"] is None:
+            return "  live tape: warming (subscribed on this call — retry in a few seconds)"
+        bits = []
+        for market in ("perp", "spot"):
+            m = live[market]
+            if m is None:
+                bits.append(f"{market} n/a")
+                continue
+            taker = f"{m['taker_ratio']:.2f}x" if m["taker_ratio"] is not None else "n/a"
+            bits.append(f"{market} CVD {m['cvd']:+.4g} (taker {taker}, {m['n_trades']} trades)")
+        return f"  live tape ({LIVE_WINDOW_S // 60}m, true aggressor side): " + " | ".join(bits)
+
     summary_lines = [f"{symbol} {interval} order flow ({limit} bars):", line("Perp", perp), line("Spot", spot)]
     if spot_perp:
         summary_lines.append(f"  → spot-vs-perp: {spot_perp}")
+    summary_lines.append(live_line())
 
     return {
         "symbol": symbol,
@@ -438,6 +562,7 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
         "perp": perp,
         "spot": spot,
         "spot_vs_perp": spot_perp,
+        "live": live,
         "summary": "\n".join(summary_lines),
     }
 
@@ -458,6 +583,9 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
     Returns each with a verdict (confirmed / weak / mixed / conflicting / unconfirmed / neutral)
     plus the CVD/taker/level context. The latest candle may be in progress — patterns confirm on
     close. Pair with get_regime (don't take counter-trend patterns in a strong trend).
+
+    A `confirmed` verdict is the green light this tool exists to produce — report it
+    as actionable confirmation, not as one more thing to hedge.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
@@ -580,10 +708,15 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300, asset_class:
               to ADX+DI only).
 
     Returns:
-      regime  — trend_up | trend_down | range | transitional
-      mode    — trend-following | mean-reversion | stand-aside
+      regime     — trend_up | trend_down | range | transitional
+      mode       — trend-following | mean-reversion | stand-aside
+      conviction — full | reduced | none. 'reduced' means tradable at smaller
+                   size with the playbook's condition, NOT "don't trade".
       adx_state (trending/developing/ranging), di_direction (only in a trend),
       above_200ema, atr(14) for stop sizing, and a one-line playbook + summary.
+
+    Regime is per-timeframe: a 4h stand-aside does not veto a 15m setup — run
+    this on the timeframe actually being traded before calling no-trade.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
@@ -605,7 +738,7 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300, asset_class:
 
     ema_note = "" if ema_200 is not None else " (200-EMA n/a — too few candles; ADX+DI only)"
     summary = (
-        f"{symbol} {interval} regime: {reg['regime'].upper()} → {reg['mode']} | "
+        f"{symbol} {interval} regime: {reg['regime'].upper()} → {reg['mode']} ({reg['conviction']} conviction) | "
         f"ADX {adx:.1f} ({reg['adx_state']}), +DI {pdi:.1f}/-DI {ndi:.1f}"
         f"{f', close {close:.6g} vs 200-EMA {ema_200:.6g}' if ema_200 is not None else ''}"
         f"{ema_note}\n  {reg['playbook']}"
@@ -616,6 +749,7 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300, asset_class:
         "interval": interval,
         "regime": reg["regime"],
         "mode": reg["mode"],
+        "conviction": reg["conviction"],
         "adx": round(adx, 2),
         "adx_state": reg["adx_state"],
         "plus_di": round(pdi, 2),
@@ -631,14 +765,134 @@ def get_regime(symbol: str, interval: str = "4h", limit: int = 300, asset_class:
 
 
 @mcp.tool()
+def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_class: str | None = None) -> dict:
+    """Signal-alignment scorecard — the explicit counterweight to per-tool caveats.
+
+    Every tool in this stack says "not alone"; this one answers "so what happens
+    when they agree?". It collects the stack's independent directional reads —
+    regime (ADX/DI/200-EMA), 20/50/200 EMA stack, CVD trend, taker ratio, VWAP
+    side, OI+price quadrant, funding & long/short contrarian extremes (crypto
+    only) — and returns one verdict:
+
+      aligned   — >=3 reads agree, none oppose: the methodology's GREEN LIGHT.
+                  Report it as an actionable window (direction + which reads
+                  agree); do not re-hedge each component.
+      leaning   — clear majority: reduced-size setup if levels cooperate.
+      mixed     — genuine disagreement: no edge (here standing aside IS the signal).
+      no_signal — everything neutral: nothing loaded either way.
+
+    symbol:   pair like 'BTCUSDT' or a stock/ETF like 'AAPL' (equities skip the
+              CVD/taker/derivatives votes and score on the remaining reads).
+    interval: candle interval for the price-based reads (default 1h — use the
+              timeframe actually being traded).
+    limit:    candles to fetch (default 300 so the 200-EMA converges).
+
+    Also returns squeeze_on and ATR as sizing/timing context (not votes).
+    """
+    symbol = symbol.upper()
+    limit = _clamp_limit(limit)
+    is_crypto = router.resolve_asset_class(symbol, asset_class) == "crypto"
+    try:
+        candles = router.fetch_ohlcv(symbol, interval, limit, asset_class)
+    except Exception as e:
+        return {"error": f"failed to fetch klines for {symbol} {interval}: {e}"}
+    if not candles:
+        return {"error": f"no candles returned for {symbol} {interval}"}
+
+    closes = [float(k[4]) for k in candles]
+    close = closes[-1]
+
+    # Price-based reads (one fetch): regime, EMA stack, CVD, taker, VWAP, squeeze.
+    adx, pdi, ndi = calc_adx(candles)
+    ema_200 = calc_ema(closes, 200)
+    reg = classify_regime(adx, pdi, ndi, close, ema_200)
+    regime_vote = {"trend_up": "bullish", "trend_down": "bearish"}.get(reg["regime"], "neutral")
+
+    ema_20, ema_50 = calc_ema(closes, 20), calc_ema(closes, 50)
+    if None in (ema_20, ema_50, ema_200):
+        stack_vote = None
+    elif close > ema_20 > ema_50 > ema_200:
+        stack_vote = "bullish"
+    elif close < ema_20 < ema_50 < ema_200:
+        stack_vote = "bearish"
+    else:
+        stack_vote = "neutral"
+
+    _, cvd_trend = calc_cvd(candles)
+    cvd_vote = {"rising": "bullish", "falling": "bearish", "flat": "neutral"}.get(cvd_trend)
+
+    taker = calc_taker_ratio(candles)
+    taker_vote = None if taker is None else \
+        "bullish" if taker > 1.05 else "bearish" if taker < 0.95 else "neutral"
+
+    session_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    s_vwap, _, _ = calc_vwap(candles, session_start_ts=session_start)
+    if s_vwap is None:
+        vwap_vote = None
+    else:
+        dist = (close - s_vwap) / s_vwap * 100
+        vwap_vote = "neutral" if abs(dist) < 0.1 else "bullish" if dist > 0 else "bearish"
+
+    sq = detect_squeeze(candles)
+    squeeze_on = None if sq is None else sq["squeeze_on"]
+
+    votes = {
+        "regime": regime_vote,
+        "ema_stack": stack_vote,
+        "cvd": cvd_vote,
+        "taker": taker_vote,
+        "vwap": vwap_vote,
+    }
+
+    # Derivatives positioning reads (crypto only): OI quadrant + contrarian extremes.
+    if is_crypto:
+        ctx = services.compute_futures_context(symbol)
+        quad = classify_oi_price(ctx["oi_change_pct_5h"], ctx["price_change_pct_5h"])["quadrant"]
+        votes["oi_quadrant"] = {"long_buildup": "bullish", "short_buildup": "bearish"}.get(quad, "neutral")
+        funding_contra = classify_funding(ctx["funding_apr"])["contrarian"]
+        votes["funding_extreme"] = funding_contra or "neutral"
+        ls_contra = classify_long_short(ctx["long_short_ratio"])["contrarian"]
+        votes["long_short_extreme"] = ls_contra or "neutral"
+
+    conf = classify_confluence(votes)
+    atr = calc_atr(candles)
+
+    counted = {k: v for k, v in votes.items() if v is not None}
+    vote_str = ", ".join(f"{k}={v}" for k, v in counted.items())
+    squeeze_note = " | squeeze ON (expansion loading)" if squeeze_on else ""
+    summary = (f"{symbol} {interval} confluence: {conf['verdict'].upper()}"
+               f"{' (' + conf['direction'] + ')' if conf['direction'] else ''}"
+               f"{squeeze_note}\n  votes: {vote_str}\n  → {conf['note']}")
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "verdict": conf["verdict"],
+        "direction": conf["direction"],
+        "agreeing": conf["agreeing"],
+        "opposing": conf["opposing"],
+        "neutral": conf["neutral"],
+        "votes": votes,
+        "regime": reg["regime"],
+        "conviction": reg["conviction"],
+        "squeeze_on": squeeze_on,
+        "atr": atr,
+        "current_close": close,
+        "summary": summary,
+    }
+
+
+@mcp.tool()
 def get_correlation(symbol: str, interval: str = "1h", limit: int = 200,
                     reference: str | None = None, asset_class: str | None = None) -> dict:
     """Rolling correlation + beta of a symbol vs a reference — tells you *when*
     symbol-specific analysis is even worth doing.
 
-    High correlation (>=0.8) means the symbol is just leveraged beta of the reference:
-    trade the reference's regime, not the specifics. A genuine drop in correlation =
-    decoupling on idiosyncratic flow, and only then do symbol-specific setups carry edge.
+    High correlation (>=0.8) means the symbol mostly trades as beta of the reference:
+    let the reference's regime set direction, and use symbol specifics for entry and
+    level selection. High correlation changes WHAT to analyze — it doesn't forbid the
+    trade. A genuine drop in correlation = decoupling on idiosyncratic flow, where
+    symbol-specific setups carry independent edge.
 
     symbol:   pair like 'SOLUSDT' or a stock/ETF like 'AAPL'.
     interval: candle interval (default 1h). limit: candles to correlate (default 200).
@@ -1077,8 +1331,9 @@ def get_squeeze(symbol: str, interval: str = "1h", limit: int = 100, period: int
     period:   Bollinger/Keltner lookback (default 20).
 
     Returns squeeze_on, BBW + percentile + state (compressed/normal/expanded), the
-    Bollinger and Keltner band levels, and a summary. ~half of squeezes fail or give
-    small moves — require a confirmation trigger before acting.
+    Bollinger and Keltner band levels, and a summary. A squeeze sets the stage, not
+    the direction — a squeeze firing WITH agreeing flow/regime (see get_confluence)
+    is a strong entry window, not another caveat.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)

@@ -1,3 +1,4 @@
 requests==2.34.2
 mcp[cli]==1.27.2
+websockets==16.0
 pytest==8.3.4
