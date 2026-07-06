@@ -45,6 +45,7 @@ ORDERBOOK_FETCHERS = {
     "binance":     binance.fetch_orderbook,
     "bybit":       bybit.fetch_orderbook,
     "hyperliquid": hyperliquid.fetch_orderbook,
+    "coinbase":    coinbase.fetch_orderbook,
 }
 
 # Crypto-derivatives signals have no equity equivalent — tools reject equity symbols cleanly.
@@ -139,6 +140,8 @@ def get_klines(symbol: str, interval: str = "1h", limit: int = 50, asset_class: 
 
     symbol:   crypto pair like 'BTCUSDT' (quote in USDT) OR a stock/ETF ticker like
               'AAPL', 'SPY', 'GLD' (via Alpaca — needs APCA_API_KEY_ID/SECRET env vars).
+              Crypto is served by Binance (spot, futures fallback); symbols Binance
+              doesn't list fall back to Bybit, Coinbase, then Hyperliquid spot.
     interval: one of 1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M (Alpaca lacks 3d).
     limit:    number of candles (1-1000).
     asset_class: 'crypto' | 'equity' | None (auto: USDT-suffix → crypto, else equity).
@@ -184,7 +187,8 @@ def get_orderbook(symbol: str, exchange: str = "binance") -> dict:
     live NBBO top-of-book quote (equities, via the Alpaca stream).
 
     symbol:   pair like 'BTCUSDT' (quote in USDT) or a stock/ETF like 'AAPL'.
-    exchange: 'binance', 'bybit', or 'hyperliquid' (ignored for equities).
+    exchange: 'binance' (spot, futures fallback), 'bybit' (perp), 'hyperliquid'
+              (perp), or 'coinbase' ({base}-USD spot). Ignored for equities.
 
     Crypto: best bid/ask, spread, and per-depth (5/10/20 level) bid vs ask volume,
     ratio, and a buy/sell/neutral pressure label, plus a text summary.
@@ -475,6 +479,8 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     and a coarse CVD-vs-price divergence flag, plus a spot-vs-perp read: a rally on
     strong perp CVD but weak spot CVD is leverage-led and fragile; spot-led CVD is
     higher-conviction accumulation. Degrades to a single market when one is unlisted.
+    Both legs are Binance-only: kline-based CVD needs the taker-buy field, which
+    only Binance klines carry (Bybit/Coinbase/Hyperliquid candles have no taker split).
     Also returns `live`: trade-level flow from the WebSocket tape (true aggressor
     side per print) as a 1m/5m/15m window ladder per market, with a `shape` label
     (accelerating / steady / fading / flipping / quiet) comparing the 1m vs 15m
@@ -1053,18 +1059,21 @@ def _fmt_usd(v):
 
 @mcp.tool()
 def get_volume_breakdown(symbol: str) -> dict:
-    """Compare 24h volume across Binance, Coinbase, and the cross-exchange aggregate.
+    """Compare 24h volume across Binance, Coinbase, Bybit, Hyperliquid, and the
+    cross-exchange aggregate.
 
     symbol: USDT-quoted pair like 'BTCUSDT'. The base asset (BTC) is used for the
-            Coinbase BTC-USD product and the CoinGecko cross-exchange aggregate.
+            Coinbase BTC-USD product, the Hyperliquid USDC spot pair, and the
+            CoinGecko cross-exchange aggregate.
 
-    Returns USD-denominated 24h volumes — Binance spot, Coinbase spot, the CoinGecko
-    cross-exchange spot aggregate, and explicit cross-venue PERP volume (Binance /
-    Bybit / Hyperliquid) — plus each spot venue's share of the aggregate, a `thin`
-    flag when aggregate volume is below $1M, and a spot-vs-perp read (Binance spot vs
-    Binance perp). Each field is null if its source is unavailable (e.g. a venue that
-    doesn't list the symbol). Note: spot shares are vs the spot aggregate; the perp
-    figures are a separate cross-venue comparison (not mixed into the spot shares).
+    Returns USD-denominated 24h volumes — Binance / Coinbase / Bybit / Hyperliquid
+    spot, the CoinGecko cross-exchange spot aggregate, and explicit cross-venue PERP
+    volume (Binance / Bybit / Hyperliquid) — plus each spot venue's share of the
+    aggregate, a `thin` flag when aggregate volume is below $1M, and a spot-vs-perp
+    read (Binance spot vs Binance perp). Each field is null if its source is
+    unavailable (e.g. a venue that doesn't list the symbol). Note: spot shares are
+    vs the spot aggregate; the perp figures are a separate cross-venue comparison
+    (not mixed into the spot shares).
 
     Use this for:
       - Coinbase share > usual vs Binance → US / institutional skew on majors.
@@ -1092,9 +1101,13 @@ def get_volume_breakdown(symbol: str) -> dict:
         "bybit_perp_volume_usd": None,
         "hyperliquid_perp_volume_usd": None,
         "coinbase_volume_usd": None,
+        "bybit_spot_volume_usd": None,
+        "hyperliquid_spot_volume_usd": None,
         "aggregate_volume_usd": None,
         "binance_share_pct": None,
         "coinbase_share_pct": None,
+        "bybit_spot_share_pct": None,
+        "hyperliquid_spot_share_pct": None,
         "other_share_pct": None,
         "perp_spot_ratio": None,
         "leverage_read": None,
@@ -1133,19 +1146,28 @@ def get_volume_breakdown(symbol: str) -> dict:
         pass
 
     try:
+        result["bybit_spot_volume_usd"] = round(float(bybit.fetch_24h_spot(symbol)["turnover24h"]), 2)
+    except Exception:
+        pass
+
+    try:
+        result["hyperliquid_spot_volume_usd"] = round(float(hyperliquid.fetch_spot_ctx(symbol)["dayNtlVlm"]), 2)
+    except Exception:
+        pass
+
+    try:
         result["aggregate_volume_usd"] = round(coingecko.fetch_aggregate_volume(base, quote="USD"), 2)
     except Exception:
         pass
 
+    spot_venues = ("binance", "coinbase", "bybit_spot", "hyperliquid_spot")
     agg_usd = result["aggregate_volume_usd"]
     if agg_usd and agg_usd > 0:
-        if result["binance_volume_usd"] is not None:
-            result["binance_share_pct"] = round(result["binance_volume_usd"] / agg_usd * 100, 2)
-        if result["coinbase_volume_usd"] is not None:
-            result["coinbase_share_pct"] = round(result["coinbase_volume_usd"] / agg_usd * 100, 2)
-        b = result["binance_share_pct"] or 0
-        c = result["coinbase_share_pct"] or 0
-        result["other_share_pct"] = round(max(0.0, 100 - b - c), 2)
+        for venue in spot_venues:
+            if result[f"{venue}_volume_usd"] is not None:
+                result[f"{venue}_share_pct"] = round(result[f"{venue}_volume_usd"] / agg_usd * 100, 2)
+        known = sum(result[f"{venue}_share_pct"] or 0 for venue in spot_venues)
+        result["other_share_pct"] = round(max(0.0, 100 - known), 2)
         result["thin"] = agg_usd < THIN_VOLUME_USD
 
     # Spot-vs-perp (same venue) — leverage-led vs spot-led participation.
@@ -1157,12 +1179,11 @@ def get_volume_breakdown(symbol: str) -> dict:
                                   "balanced" if ratio >= 0.8 else "spot-led (more durable)"
 
     parts = [f"{base} 24h vol:", f"agg={_fmt_usd(agg_usd)}"]
-    if result["binance_volume_usd"] is not None:
-        share = f" ({result['binance_share_pct']}%)" if result["binance_share_pct"] is not None else ""
-        parts.append(f"Binance spot={_fmt_usd(result['binance_volume_usd'])}{share}")
-    if result["coinbase_volume_usd"] is not None:
-        share = f" ({result['coinbase_share_pct']}%)" if result["coinbase_share_pct"] is not None else ""
-        parts.append(f"Coinbase={_fmt_usd(result['coinbase_volume_usd'])}{share}")
+    for label, venue in (("Binance spot", "binance"), ("Coinbase", "coinbase"),
+                         ("Bybit spot", "bybit_spot"), ("HL spot", "hyperliquid_spot")):
+        if result[f"{venue}_volume_usd"] is not None:
+            share = f" ({result[f'{venue}_share_pct']}%)" if result[f"{venue}_share_pct"] is not None else ""
+            parts.append(f"{label}={_fmt_usd(result[f'{venue}_volume_usd'])}{share}")
     if result["other_share_pct"] is not None:
         parts.append(f"other={result['other_share_pct']}%")
     # Cross-venue perp volume (Binance/Bybit/Hyperliquid) — separate from the spot aggregate.
