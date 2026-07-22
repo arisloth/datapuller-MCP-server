@@ -67,15 +67,21 @@ def fetch_spot_ctx(symbol: str) -> dict:
     return ctx
 
 
+def spot_pair_name(symbol: str) -> str:
+    """Canonical USDC spot-pair id (e.g. '@107') for a symbol — the `coin` used
+    by candleSnapshot and the trades WebSocket. Raises if there is no pair."""
+    r = SESSION.post(API, json={"type": "spotMeta"}, timeout=TIMEOUT)
+    r.raise_for_status()
+    return _spot_pair_name(r.json(), _coin(symbol))
+
+
 def fetch_klines_spot(symbol: str, interval: str, limit: int):
     """USDC spot-pair candles normalized to Binance-style [openTime_ms, o, h, l, c, v]
     rows (oldest first). No taker-buy field — CVD/taker metrics degrade to n/a."""
     minutes = INTERVAL_MIN.get(interval)
     if minutes is None:
         raise ValueError(f"hyperliquid: unsupported interval '{interval}' (supported: {', '.join(INTERVAL_MIN)})")
-    r = SESSION.post(API, json={"type": "spotMeta"}, timeout=TIMEOUT)
-    r.raise_for_status()
-    pair = _spot_pair_name(r.json(), _coin(symbol))
+    pair = spot_pair_name(symbol)
 
     end_ms = int(time.time() * 1000)
     req = {"coin": pair, "interval": interval, "startTime": end_ms - minutes * 60_000 * limit, "endTime": end_ms}

@@ -1,24 +1,26 @@
 """
-Bybit v5 public linear (USDT perp) trade stream → tape store.
+Bybit v5 public trade streams (linear USDT perp + spot) → tape store.
 
-publicTrade carries the true taker side per print (`S`: "Buy"/"Sell").
-The manager sources the PERP tape from Bybit rather than Binance futures:
-Binance's fstream data plane is silently filtered on some networks (handshake
-succeeds, no frames ever arrive), while Bybit's stream is reliable and the
-perp aggressor-flow signal is equivalent.
+publicTrade carries the true taker side per print (`S`: "Buy"/"Sell") on both
+categories; only the endpoint differs. The manager sources the PERP tape from
+Bybit rather than Binance futures: Binance's fstream data plane is silently
+filtered on some networks (handshake succeeds, no frames ever arrive), while
+Bybit's stream is reliable and the perp aggressor-flow signal is equivalent.
+The spot endpoint serves the SPOT tape for coins Binance spot doesn't list.
 """
 from store import STORE
 
 from .base import StreamClient
 
 LINEAR_WS = "wss://stream.bybit.com/v5/public/linear"
+SPOT_WS   = "wss://stream.bybit.com/v5/public/spot"
 
 
 class BybitTradeStream(StreamClient):
     app_ping = {"op": "ping"}   # Bybit expects a JSON ping every ~20s
 
-    def __init__(self, prefix: str = "PERP"):
-        super().__init__(LINEAR_WS)
+    def __init__(self, prefix: str = "PERP", url: str = LINEAR_WS):
+        super().__init__(url)
         self.prefix = prefix
         self.symbols: set[str] = set()
 

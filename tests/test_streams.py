@@ -15,6 +15,7 @@ import pytest  # noqa: E402
 from store import TapeStore  # noqa: E402
 from streams import binance as bstream  # noqa: E402
 from streams import bybit as bybit_stream  # noqa: E402
+from streams import hyperliquid as hl_stream  # noqa: E402
 from streams import manager  # noqa: E402
 
 
@@ -23,6 +24,7 @@ def fresh_store(monkeypatch):
     s = TapeStore()
     monkeypatch.setattr(bstream, "STORE", s)
     monkeypatch.setattr(bybit_stream, "STORE", s)
+    monkeypatch.setattr(hl_stream, "STORE", s)
     return s
 
 
@@ -80,6 +82,49 @@ def test_bybit_acks_and_pongs_ignored(fresh_store):
     assert fresh_store.flow("PERP:BTCUSDT") is None
 
 
+def test_bybit_spot_variant_keys_spot_tape(fresh_store):
+    c = bybit_stream.BybitTradeStream("SPOT", url=bybit_stream.SPOT_WS)
+    assert c.url == bybit_stream.SPOT_WS
+    c.handle({"topic": "publicTrade.HYPEUSDT", "type": "snapshot",
+              "data": [{"T": 1_700_000_000_000, "s": "HYPEUSDT", "S": "Buy", "v": "3.0", "p": "70"}]})
+    assert fresh_store.flow("SPOT:HYPEUSDT")["cvd"] == pytest.approx(3.0)
+
+
+# --- HyperliquidTradeStream.handle → store -------------------------------------
+
+def test_hyperliquid_trades_frame_lands_in_store(fresh_store):
+    c = hl_stream.HyperliquidTradeStream("SPOT")
+    asyncio.run(c.subscribe("HYPEUSDT", "@107"))
+    # B = taker bought, A = taker sold; coin id maps back to the symbol
+    c.handle({"channel": "trades", "data": [
+        {"coin": "@107", "side": "B", "px": "71.5", "sz": "2.0", "time": 1_700_000_000_000},
+        {"coin": "@107", "side": "A", "px": "71.4", "sz": "0.5", "time": 1_700_000_001_000},
+        {"coin": "@999", "side": "B", "px": "1.0", "sz": "9.9", "time": 1_700_000_002_000},  # unknown coin
+    ]})
+    f = fresh_store.flow("SPOT:HYPEUSDT")
+    assert f["n_trades"] == 2
+    assert f["cvd"] == pytest.approx(1.5)
+
+
+def test_hyperliquid_acks_and_pongs_ignored(fresh_store):
+    c = hl_stream.HyperliquidTradeStream("SPOT")
+    asyncio.run(c.subscribe("HYPEUSDT", "@107"))
+    c.handle({"channel": "subscriptionResponse", "data": {}})
+    c.handle({"channel": "pong"})
+    assert fresh_store.flow("SPOT:HYPEUSDT") is None
+
+
+def test_hyperliquid_subscribe_bookkeeping_offline():
+    c = hl_stream.HyperliquidTradeStream("SPOT")
+    asyncio.run(c.subscribe("hypeusdt", "@107"))
+    asyncio.run(c.subscribe("HYPEUSDT", "@107"))   # idempotent, case-normalized
+    assert c.symbols == {"HYPEUSDT": "@107"}
+    assert c.coins == {"@107": "HYPEUSDT"}
+    asyncio.run(c.unsubscribe("HYPEUSDT"))
+    assert c.symbols == {} and c.coins == {}
+    asyncio.run(c.unsubscribe("HYPEUSDT"))         # no-op, no raise
+
+
 # --- subscribe/unsubscribe bookkeeping (no connection) ------------------------
 
 def test_subscribe_bookkeeping_offline():
@@ -114,7 +159,7 @@ def test_resubscribe_params_on_open():
 class _FakeClient:
     instances = []
 
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         self.subscribed = []
         self.unsubscribed = []
         _FakeClient.instances.append(self)
@@ -122,7 +167,7 @@ class _FakeClient:
     async def run(self):
         return
 
-    async def subscribe(self, symbol):
+    async def subscribe(self, symbol, coin=None):
         self.subscribed.append(symbol)
 
     async def unsubscribe(self, symbol):
@@ -134,8 +179,13 @@ def fake_manager(monkeypatch):
     _FakeClient.instances = []
     monkeypatch.setattr(manager.binance, "BinanceTradeStream", _FakeClient)
     monkeypatch.setattr(manager.bybit, "BybitTradeStream", _FakeClient)
+    monkeypatch.setattr(manager.hyperliquid, "HyperliquidTradeStream", _FakeClient)
     monkeypatch.setattr(manager, "_clients", {})
     monkeypatch.setattr(manager, "_budget_crypto", manager.SubscriptionBudget(budget=2))
+    monkeypatch.setattr(manager, "_spot_route", {})
+    # no network in tests: everything routes to Binance unless a test re-patches
+    monkeypatch.setattr(manager, "_resolve_spot_route",
+                        lambda s: manager._spot_route.setdefault(s, ("binance", s)))
     return manager
 
 
@@ -164,6 +214,33 @@ def test_manager_lru_eviction_unsubscribes(fake_manager):
     for c in _FakeClient.instances:
         assert c.subscribed == ["AUSDT", "BUSDT", "CUSDT"]
         assert c.unsubscribed == ["AUSDT"]
+
+
+def test_manager_routes_spot_by_venue(fake_manager, monkeypatch):
+    routes = {"BTCUSDT": ("binance", "BTCUSDT"),
+              "HYPEUSDT": ("bybit", "HYPEUSDT"),
+              "PURRUSDT": ("hyperliquid", "PURR/USDC")}
+    monkeypatch.setattr(fake_manager, "_resolve_spot_route",
+                        lambda s: fake_manager._spot_route.setdefault(s, routes[s]))
+
+    for sym in routes:
+        fake_manager.ensure_subscribed_crypto(sym)
+    _drain(fake_manager)
+
+    # perp + one spot client per venue, each symbol only on its own venue
+    assert set(fake_manager._clients) == {"perp", "spot:binance", "spot:bybit", "spot:hyperliquid"}
+    assert fake_manager._clients["perp"].subscribed == ["BTCUSDT", "HYPEUSDT", "PURRUSDT"]
+    assert fake_manager._clients["spot:binance"].subscribed == ["BTCUSDT"]
+    assert fake_manager._clients["spot:bybit"].subscribed == ["HYPEUSDT"]
+    assert fake_manager._clients["spot:hyperliquid"].subscribed == ["PURRUSDT"]
+
+    # venue label for get_cvd
+    assert fake_manager.spot_venue("PURRUSDT") == "hyperliquid"
+    assert fake_manager.spot_venue("UNRESOLVED") == "binance"
+
+    # budget=2 → BTCUSDT evicted; the sweep reaches every spot client
+    for c in _FakeClient.instances:
+        assert c.unsubscribed == ["BTCUSDT"]
 
 
 # --- get_cvd live wiring ---------------------------------------------------------

@@ -20,6 +20,19 @@ DOJI_BODY_PCT = 0.1      # candle body <= this fraction of range => doji (indeci
 PIN_WICK_RATIO = 2.0     # dominant wick >= this x body => pin bar (hammer / shooting star)
 MARUBOZU_WICK_PCT = 0.05 # each wick <= this fraction of range => marubozu (full-body conviction)
 
+# --- Stretch / exhaustion thresholds (the counter-trend layer) --------------
+# Crypto trends run hot, so the RSI bands sit wider than the equity-classic 70/30.
+RSI_OVERBOUGHT = 75.0
+RSI_OVERSOLD   = 25.0
+VWAP_SIGMA_EXTREME = 2.0    # |close - VWAP| >= this many σ => stretched
+# Percentile gates for the contrarian positioning reads. The absolute floors stop
+# "90th percentile of a flat regime" from reading as an extreme.
+EXTREME_PCTL_HIGH = 90.0
+EXTREME_PCTL_LOW  = 10.0
+FUNDING_MIN_EXTREME_APR = 20.0  # percentile gate needs at least this |APR|
+LS_PCTL_FLOOR_LONG  = 1.5       # percentile gate needs L/S at least this rich...
+LS_PCTL_FLOOR_SHORT = 1.0       # ...or at most this poor
+
 
 def calc_obv(candles):
     obv = 0.0
@@ -56,6 +69,73 @@ def calc_ema(closes, period: int):
     for c in closes[period:]:
         ema = c * k + ema * (1 - k)
     return ema
+
+
+def calc_rsi(closes, period: int = 14):
+    """Wilder-smoothed RSI over the close series. Returns None if there aren't
+    at least period+1 closes; 100.0 when the window has no losses at all."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+
+def find_swing_points(values, left: int = 2, right: int = 2):
+    """Fractal pivots: index i is a swing high when values[i] beats the `left`
+    values before it strictly and the `right` after it non-strictly (mirrored
+    for lows — the asymmetry keeps flat-topped double prints from vanishing).
+    Returns (high_idxs, low_idxs), both ascending. The last `right` bars can
+    never confirm a pivot yet, so fresh extremes appear only after `right` bars."""
+    highs, lows = [], []
+    for i in range(left, len(values) - right):
+        v = values[i]
+        before = values[i - left:i]
+        after = values[i + 1:i + 1 + right]
+        if all(v > x for x in before) and all(v >= x for x in after):
+            highs.append(i)
+        if all(v < x for x in before) and all(v <= x for x in after):
+            lows.append(i)
+    return highs, lows
+
+
+def classify_stretch(close, rsi, vwap, vwap_sigma) -> dict:
+    """Stretch/exhaustion read — the counterweight to the trend cluster. Combines
+    RSI(14) bands with the close's σ-distance from (session) VWAP. `contrarian`
+    fires only when EVERY available measure agrees the price is extended (a single
+    available measure may fire alone); a split read stays 'normal'. Degrades to
+    'n/a' when neither measure is available."""
+    vwap_sigmas = None
+    if vwap is not None and vwap_sigma:
+        vwap_sigmas = (close - vwap) / vwap_sigma
+
+    def side(value, hi, lo):
+        if value is None:
+            return None
+        return "up" if value >= hi else "down" if value <= lo else "normal"
+
+    reads = [s for s in (side(rsi, RSI_OVERBOUGHT, RSI_OVERSOLD),
+                         side(vwap_sigmas, VWAP_SIGMA_EXTREME, -VWAP_SIGMA_EXTREME))
+             if s is not None]
+    if not reads:
+        state, contrarian = "n/a", None
+    elif all(s == "up" for s in reads):
+        state, contrarian = "extended_up", "bearish"
+    elif all(s == "down" for s in reads):
+        state, contrarian = "extended_down", "bullish"
+    else:
+        state, contrarian = "normal", None
+    return {"state": state, "rsi": rsi, "vwap_sigmas": vwap_sigmas, "contrarian": contrarian}
 
 
 def calc_vwap(candles, session_start_ts: int | None = None):
@@ -153,15 +233,17 @@ def calc_volume_profile(candles, bins: int = 24, value_area_pct: float = 0.70):
 
 
 def calc_volume_ratio(candles, n=20):
+    """Volume of the last CLOSED bar vs the average of the n bars before it.
+    The newest bar is excluded entirely — it's usually still forming, and an
+    in-progress numerator systematically understates the ratio."""
     volumes = [float(k[5]) for k in candles]
-    if len(volumes) < 2:
+    if len(volumes) < 3:
         return 0.0
-    # exclude last bar (may be incomplete); average over whatever history exists
-    prior = volumes[-n - 1:-1]
+    prior = volumes[-n - 2:-2]
     avg = sum(prior) / len(prior)
     if avg == 0:
         return 0.0
-    return volumes[-1] / avg
+    return volumes[-2] / avg
 
 
 def calc_adx(candles, period=14):
@@ -407,18 +489,29 @@ def classify_oi_price(oi_change_pct, price_change_pct, flat: float = OI_FLAT_PCT
     return {"quadrant": q, "label": label, "interpretation": interp}
 
 
-def classify_long_short(ratio) -> dict:
+def classify_long_short(ratio, percentile=None) -> dict:
     """Global account long/short ratio reframed per Plan.md: the absolute level
     is noise; only genuine extremes carry (contrarian) content. Most retail
-    accounts sit structurally long, so 'longs dominant' is NOT directional."""
+    accounts sit structurally long, so 'longs dominant' is NOT directional.
+    Extremes fire on the absolute gates OR on the ratio's percentile vs its own
+    recent history (>=90th / <=10th, with a mild absolute floor) — the absolute
+    gates alone sit outside the ratio's realistic range on majors."""
     if ratio is None:
         return {"reading": "neutral", "contrarian": None, "note": "n/a"}
-    if ratio >= LS_EXTREME_LONG:
+    pctl_long = (percentile is not None and percentile >= EXTREME_PCTL_HIGH
+                 and ratio >= LS_PCTL_FLOOR_LONG)
+    pctl_short = (percentile is not None and percentile <= EXTREME_PCTL_LOW
+                  and ratio <= LS_PCTL_FLOOR_SHORT)
+    if ratio >= LS_EXTREME_LONG or pctl_long:
+        gate = (f">= {LS_EXTREME_LONG:g}" if ratio >= LS_EXTREME_LONG
+                else f"{percentile:.0f}th pct of its own history")
         return {"reading": "extreme_long_crowding", "contrarian": "bearish",
-                "note": f"overcrowded longs (>= {LS_EXTREME_LONG:g}) — contrarian bearish / long-squeeze fuel."}
-    if ratio <= LS_EXTREME_SHORT:
+                "note": f"overcrowded longs ({gate}) — contrarian bearish / long-squeeze fuel."}
+    if ratio <= LS_EXTREME_SHORT or pctl_short:
+        gate = (f"<= {LS_EXTREME_SHORT:g}" if ratio <= LS_EXTREME_SHORT
+                else f"{percentile:.0f}th pct of its own history")
         return {"reading": "extreme_short_crowding", "contrarian": "bullish",
-                "note": f"overcrowded shorts (<= {LS_EXTREME_SHORT:g}) — contrarian bullish / short-squeeze fuel."}
+                "note": f"overcrowded shorts ({gate}) — contrarian bullish / short-squeeze fuel."}
     return {"reading": "neutral", "contrarian": None,
             "note": "mid-range — noise, not directional (absolute level carries no edge)."}
 
@@ -451,21 +544,29 @@ def _has_taker(candles) -> bool:
     return bool(candles) and len(candles[0]) > 9
 
 
+def _cvd_series(candles):
+    """Running CVD value per candle (taker-buy minus taker-sell, cumulative).
+    None when the rows carry no taker-buy field."""
+    if not _has_taker(candles):
+        return None
+    cvd = 0.0
+    series = []
+    for k in candles:
+        cvd += 2 * float(k[9]) - float(k[5])
+        series.append(cvd)
+    return series
+
+
 def calc_cvd(candles):
     """Cumulative Volume Delta — running net of taker-buy minus taker-sell volume
     (aggressor intent). Returns (cvd, trend). Unlike OBV (close-to-close) this
     signs executed flow; CVD strictly dominates OBV on perps. The absolute value
     is meaningless (start-point dependent) — read the trend/slope. Returns
     (None, "n/a") when the kline rows carry no taker-buy field."""
-    if not _has_taker(candles):
+    series = _cvd_series(candles)
+    if series is None:
         return None, "n/a"
-    cvd = 0.0
-    series = []
-    for k in candles:
-        total = float(k[5])
-        taker_buy = float(k[9])
-        cvd += 2 * taker_buy - total
-        series.append(cvd)
+    cvd = series[-1]
 
     n = min(5, len(series) // 2)
     if n == 0:
@@ -497,16 +598,21 @@ def calc_taker_ratio(candles, n: int | None = None):
 
 
 def cvd_divergence(candles) -> dict:
-    """Coarse slope-based CVD/price divergence (NOT swing-based — read with
-    structure). price up + CVD down => bearish (distribution/exhaustion);
-    price down + CVD up => bullish (absorption/accumulation)."""
+    """Swing-anchored CVD/price divergence: compares the last two price swing lows
+    (and highs) against CVD at the same bars. Price lower-low + CVD higher-low =>
+    bullish (absorption/accumulation); price higher-high + CVD lower-high =>
+    bearish (distribution/exhaustion). This is the read that CAN fire at a local
+    extreme — a slope comparison never does, because both slopes agree there.
+    Falls back to the coarse slope comparison when the window has no two swings;
+    `method` reports which path produced the verdict."""
+    series = _cvd_series(candles)
     _, cvd_trend = calc_cvd(candles)
     if cvd_trend == "n/a":
-        return {"price_trend": "n/a", "cvd_trend": "n/a", "divergence": "none"}
+        return {"price_trend": "n/a", "cvd_trend": "n/a", "divergence": "none", "method": "slope"}
     closes = [float(k[4]) for k in candles]
     n = min(5, len(closes) // 2)
     if n == 0:
-        return {"price_trend": "flat", "cvd_trend": cvd_trend, "divergence": "none"}
+        return {"price_trend": "flat", "cvd_trend": cvd_trend, "divergence": "none", "method": "slope"}
     recent = sum(closes[-n:]) / n
     prior  = sum(closes[-2 * n:-n]) / n
     if recent > prior:
@@ -516,12 +622,29 @@ def cvd_divergence(candles) -> dict:
     else:
         price_trend = "flat"
 
+    high_idxs, low_idxs = find_swing_points(closes)
+    if len(high_idxs) >= 2 or len(low_idxs) >= 2:
+        # Swing path: check both sides, keep whichever divergence is more recent.
+        candidates = []
+        if len(low_idxs) >= 2:
+            a, b = low_idxs[-2], low_idxs[-1]
+            if closes[b] < closes[a] and series[b] > series[a]:
+                candidates.append((b, "bullish"))
+        if len(high_idxs) >= 2:
+            a, b = high_idxs[-2], high_idxs[-1]
+            if closes[b] > closes[a] and series[b] < series[a]:
+                candidates.append((b, "bearish"))
+        divergence = max(candidates)[1] if candidates else "none"
+        return {"price_trend": price_trend, "cvd_trend": cvd_trend,
+                "divergence": divergence, "method": "swing"}
+
     divergence = "none"
     if price_trend == "rising" and cvd_trend == "falling":
         divergence = "bearish"
     elif price_trend == "falling" and cvd_trend == "rising":
         divergence = "bullish"
-    return {"price_trend": price_trend, "cvd_trend": cvd_trend, "divergence": divergence}
+    return {"price_trend": price_trend, "cvd_trend": cvd_trend,
+            "divergence": divergence, "method": "slope"}
 
 
 def calc_bollinger(closes, period: int = 20, mult: float = 2.0):
@@ -623,16 +746,27 @@ def infer_funding_interval_hours(history) -> float:
     return round(median) or 8.0
 
 
-def classify_funding(apr, threshold: float = FUNDING_EXTREME_APR) -> dict:
-    """Annualized funding → contrarian extreme flag. Mid-range is context, not a signal."""
+def classify_funding(apr, percentile=None, threshold: float = FUNDING_EXTREME_APR) -> dict:
+    """Annualized funding → contrarian extreme flag. Mid-range is context, not a
+    signal. Extremes fire on the absolute APR threshold OR on funding's percentile
+    vs its own settled history (>=90th / <=10th, floored at
+    ±FUNDING_MIN_EXTREME_APR so a quiet regime's top decile doesn't read as hot)."""
     if apr is None:
         return {"reading": "neutral", "contrarian": None, "note": "n/a"}
-    if apr >= threshold:
+    pctl_long = (percentile is not None and percentile >= EXTREME_PCTL_HIGH
+                 and apr >= FUNDING_MIN_EXTREME_APR)
+    pctl_short = (percentile is not None and percentile <= EXTREME_PCTL_LOW
+                  and apr <= -FUNDING_MIN_EXTREME_APR)
+    if apr >= threshold or pctl_long:
+        gate = (f">= +{threshold:g}% APR" if apr >= threshold
+                else f"{percentile:.0f}th pct of its own history at {apr:+.0f}% APR")
         return {"reading": "extreme_long_crowding", "contrarian": "bearish",
-                "note": f"funding >= +{threshold:g}% APR — overcrowded longs (contrarian bearish / cascade fuel)."}
-    if apr <= -threshold:
+                "note": f"funding {gate} — overcrowded longs (contrarian bearish / cascade fuel)."}
+    if apr <= -threshold or pctl_short:
+        gate = (f"<= -{threshold:g}% APR" if apr <= -threshold
+                else f"{percentile:.0f}th pct of its own history at {apr:+.0f}% APR")
         return {"reading": "extreme_short_crowding", "contrarian": "bullish",
-                "note": f"funding <= -{threshold:g}% APR — overcrowded shorts (contrarian bullish / squeeze setup)."}
+                "note": f"funding {gate} — overcrowded shorts (contrarian bullish / squeeze setup)."}
     return {"reading": "neutral", "contrarian": None,
             "note": "funding mid-range — context only, not a timing trigger."}
 
@@ -774,9 +908,17 @@ def detect_candle_patterns(candles) -> list:
     return found
 
 
-def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level) -> dict:
+def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level,
+                                  flow_shape: str | None = None) -> dict:
     """Whether a directional candle pattern is CONFIRMED by order flow + location.
-    Patterns are confirmation, never standalone triggers."""
+    Patterns are confirmation, never standalone triggers.
+
+    `flow_shape` (optional) is the live tape's ladder state (see
+    classify_flow_ladder). Window CVD/taker lag reversals by construction, so a
+    reversal pattern against the prior flow would always score 'conflicting' —
+    the live shape breaks that: 'flipping' (tape running against the prior flow)
+    turns pure conflict into `reversal_watch`, and 'fading' (prior push going
+    stale) softens it to 'mixed'."""
     if direction == "neutral":
         return {"verdict": "neutral",
                 "note": "indecision / compression — becomes tradable on the breakout side once CVD/taker pick a direction."}
@@ -799,6 +941,15 @@ def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level) -
         return {"verdict": "mixed",
                 "note": f"order flow is mixed on the {direction} pattern (CVD and taker disagree) — wait for them to realign before acting."}
     if conflict:
+        if flow_shape == "flipping":
+            return {"verdict": "reversal_watch",
+                    "note": f"{direction} pattern against the prior flow, but the live tape is FLIPPING "
+                            f"the same way — early-reversal candidate, not a fakeout read. Confirm on "
+                            f"close; if it holds, this is a genuine counter-trend entry at reduced size."}
+        if flow_shape == "fading":
+            return {"verdict": "mixed",
+                    "note": f"order flow disagrees with the {direction} pattern but the live tape shows the "
+                            f"prior push FADING — the conflict is stale; watch for the tape to flip before acting."}
         return {"verdict": "conflicting",
                 "note": f"order flow disagrees with the {direction} pattern — fakeout risk; the opposite-side read may be the real signal."}
     if agree and at_level:
@@ -846,20 +997,45 @@ def classify_flow_ladder(cvd_short, cvd_long, short_s: float, long_s: float) -> 
 # Every signal above is framed "not alone"; this is where "together" gets a
 # voice. When independent reads agree, say so as plainly as a risk flag.
 
-CONFLUENCE_ALIGNED_MIN = 3  # unopposed agreeing reads needed for a full 'aligned' verdict
+CONFLUENCE_ALIGNED_MIN = 3  # unopposed agreeing CLUSTERS needed for a full 'aligned' verdict
 
 
-def classify_confluence(votes: dict) -> dict:
+def _cluster_count(names, clusters):
+    """Distinct clusters among `names`; a name without a cluster is its own."""
+    if not clusters:
+        return len(names)
+    return len({clusters.get(k, k) for k in names})
+
+
+def classify_confluence(votes: dict, clusters: dict | None = None,
+                        extension=()) -> dict:
     """Aggregate named directional reads into one explicit alignment verdict.
 
     `votes` maps signal name → 'bullish' | 'bearish' | 'neutral' | None
-    (None = unavailable, excluded). Verdicts:
-      aligned   — >= CONFLUENCE_ALIGNED_MIN reads agree, none oppose: the
-                  methodology's green light. Remaining caveats are sizing
-                  inputs, not reasons to stand aside.
-      leaning   — clear majority one way: reduced-size setup.
-      mixed     — reads genuinely disagree: no edge (standing aside IS the signal).
-      no_signal — every read neutral: nothing loaded, not caution.
+    (None = unavailable, excluded).
+
+    `clusters` maps vote name → cluster id; correlated reads (e.g. every function
+    of the same recent price path) share a cluster and count ONCE toward
+    agreement, so a pure trend-following sweep can't reach 'aligned' by itself —
+    it needs an independent dimension (flow, positioning) to agree. Votes absent
+    from the map are their own cluster. Without `clusters`, every vote counts.
+
+    `extension` names votes that flag overextension (stretch). When the ONLY
+    opposition comes from extension votes, alignment isn't vetoed — the verdict
+    is suffixed '_extended': the setup is real but late; enter on a pullback,
+    don't chase.
+
+    Verdicts:
+      aligned            — >= CONFLUENCE_ALIGNED_MIN clusters agree, none oppose:
+                           the methodology's green light. Remaining caveats are
+                           sizing inputs, not reasons to stand aside.
+      aligned_extended   — same agreement, but price is stretched against the
+                           direction: continuation entry on pullback, not chase.
+      leaning            — clear cluster majority one way: reduced-size setup.
+      leaning_extended   — leaning + stretched: wait for the pullback.
+      mixed              — reads genuinely disagree: no edge (standing aside IS
+                           the signal).
+      no_signal          — every read neutral: nothing loaded, not caution.
     """
     cast = {k: v for k, v in votes.items() if v is not None}
     bull = sorted(k for k, v in cast.items() if v == "bullish")
@@ -869,30 +1045,47 @@ def classify_confluence(votes: dict) -> dict:
     if not bull and not bear:
         return {"direction": None, "verdict": "no_signal",
                 "agreeing": [], "opposing": [], "neutral": neutral,
+                "agreeing_clusters": 0,
                 "note": "every read is neutral — nothing is loaded either way. "
                         "That is absence of signal, not a reason for extra caution."}
 
-    if len(bull) >= len(bear):
+    if _cluster_count(bull, clusters) >= _cluster_count(bear, clusters):
         direction, agreeing, opposing = "long", bull, bear
     else:
         direction, agreeing, opposing = "short", bear, bull
 
-    if not opposing and len(agreeing) >= CONFLUENCE_ALIGNED_MIN:
-        note = (f"{len(agreeing)} independent reads agree ({direction}: {', '.join(agreeing)}) "
-                f"with none opposing — by this stack's own confluence standard this IS an "
-                f"actionable window. Treat remaining caveats as sizing inputs, not vetoes.")
+    agree_c = _cluster_count(agreeing, clusters)
+    hard_opposing = [k for k in opposing if k not in extension]
+    ext_opposing = [k for k in opposing if k in extension]
+    hard_oppose_c = _cluster_count(hard_opposing, clusters)
+
+    ext_note = ""
+    if ext_opposing:
+        ext_note = (f" ⚠ price is stretched against the {direction} "
+                    f"({', '.join(ext_opposing)}) — continuation entry on a pullback, don't chase.")
+
+    if not hard_opposing and agree_c >= CONFLUENCE_ALIGNED_MIN:
+        note = (f"{len(agreeing)} reads across {agree_c} independent dimensions agree "
+                f"({direction}: {', '.join(agreeing)}) with none opposing — by this stack's own "
+                f"confluence standard this IS an actionable window. Treat remaining caveats as "
+                f"sizing inputs, not vetoes.")
         verdict = "aligned"
-    elif len(agreeing) >= 2 * max(len(opposing), 1):
-        note = (f"majority of reads lean {direction} ({len(agreeing)} vs {len(opposing)}"
-                f"{' opposing: ' + ', '.join(opposing) if opposing else ''}) — "
+    elif not hard_opposing or agree_c >= 2 * max(hard_oppose_c, 1):
+        note = (f"majority of reads lean {direction} ({agree_c} vs {hard_oppose_c} dimensions"
+                f"{'; opposing: ' + ', '.join(opposing) if opposing else ''}) — "
                 f"a reduced-size setup if regime and levels cooperate.")
         verdict = "leaning"
     else:
-        note = (f"reads genuinely disagree ({direction} {len(agreeing)} vs {len(opposing)}: "
+        note = (f"reads genuinely disagree ({direction} {agree_c} vs {hard_oppose_c} dimensions: "
                 f"{', '.join(opposing)} oppose) — no edge either way. This is the one case "
                 f"where standing aside is the signal, not the default.")
         verdict = "mixed"
 
+    if verdict in ("aligned", "leaning") and ext_opposing:
+        verdict += "_extended"
+        note += ext_note
+
     return {"direction": direction, "verdict": verdict,
             "agreeing": agreeing, "opposing": opposing, "neutral": neutral,
+            "agreeing_clusters": agree_c,
             "note": note}

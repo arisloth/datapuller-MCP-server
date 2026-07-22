@@ -20,7 +20,10 @@ from indicators import (  # noqa: E402
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     detect_candle_patterns, classify_pattern_confirmation,
     classify_confluence, classify_flow_ladder,
+    calc_rsi, find_swing_points, classify_stretch,
     LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
+    RSI_OVERBOUGHT, RSI_OVERSOLD, VWAP_SIGMA_EXTREME,
+    FUNDING_MIN_EXTREME_APR, LS_PCTL_FLOOR_LONG, LS_PCTL_FLOOR_SHORT,
 )
 
 
@@ -131,16 +134,19 @@ def test_calc_obv_small_input_is_flat_not_crash():
 
 # --- calc_volume_ratio ----------------------------------------------------
 
-def test_calc_volume_ratio_basic():
-    # prior 20 bars avg 10, last bar 20 => ratio 2.0
+def test_calc_volume_ratio_uses_last_closed_bar():
+    # prior 20 bars avg 10, last CLOSED bar 20, in-progress bar 3 => ratio 2.0
     candles = [candle(i, 1, 1, 1, 1, 10) for i in range(20)]
     candles.append(candle(20, 1, 1, 1, 1, 20))
+    candles.append(candle(21, 1, 1, 1, 1, 3))   # forming bar — must be ignored
     assert calc_volume_ratio(candles) == pytest.approx(2.0)
 
 
 def test_calc_volume_ratio_small_input_no_crash():
-    candles = [candle(0, 1, 1, 1, 1, 10), candle(1, 1, 1, 1, 1, 20)]
+    candles = [candle(0, 1, 1, 1, 1, 10), candle(1, 1, 1, 1, 1, 20), candle(2, 1, 1, 1, 1, 5)]
     assert calc_volume_ratio(candles) == pytest.approx(2.0)
+    # fewer than 3 bars → no closed bar with history to compare
+    assert calc_volume_ratio(candles[:2]) == 0.0
 
 
 # --- calc_volume_profile --------------------------------------------------
@@ -733,4 +739,236 @@ def test_flow_ladder_flipping():
 def test_flow_ladder_quiet_and_none():
     assert classify_flow_ladder(0.0, 0.0, 60, 900)["state"] == "quiet"
     assert classify_flow_ladder(None, 90.0, 60, 900) is None
+
+
+# --- calc_rsi ---------------------------------------------------------------
+
+def test_calc_rsi_known_value():
+    # diffs +1,+1,-1,+1 with period 2: seed gain 1 / loss 0, then Wilder-smooth
+    # to avg_gain 0.75 / avg_loss 0.25 → RS 3 → RSI 75
+    assert calc_rsi([1, 2, 3, 2, 3], period=2) == pytest.approx(75.0)
+
+
+def test_calc_rsi_all_gains_is_100():
+    assert calc_rsi([1, 2, 3, 4, 5], period=3) == pytest.approx(100.0)
+
+
+def test_calc_rsi_none_when_too_few():
+    assert calc_rsi([1, 2, 3], period=14) is None
+
+
+# --- find_swing_points --------------------------------------------------------
+
+def test_find_swing_points_zigzag():
+    highs, lows = find_swing_points([1, 2, 3, 2, 1, 2, 3])
+    assert highs == [2]
+    assert lows == [4]
+
+
+def test_find_swing_points_monotone_has_none():
+    highs, lows = find_swing_points([1, 2, 3, 4, 5, 6])
+    assert highs == [] and lows == []
+
+
+# --- classify_stretch ---------------------------------------------------------
+
+def test_stretch_extended_up_both_agree():
+    # RSI over the band + 2.5σ above VWAP → extended_up, contrarian bearish
+    r = classify_stretch(close=105, rsi=RSI_OVERBOUGHT + 5, vwap=100, vwap_sigma=2.0)
+    assert r["state"] == "extended_up"
+    assert r["contrarian"] == "bearish"
+    assert r["vwap_sigmas"] == pytest.approx(2.5)
+
+
+def test_stretch_extended_down_both_agree():
+    r = classify_stretch(close=95, rsi=RSI_OVERSOLD - 5, vwap=100, vwap_sigma=2.0)
+    assert r["state"] == "extended_down"
+    assert r["contrarian"] == "bullish"
+
+
+def test_stretch_split_read_is_normal():
+    # RSI extreme but price near VWAP → measures disagree → no contrarian call
+    r = classify_stretch(close=100.5, rsi=RSI_OVERBOUGHT + 5, vwap=100, vwap_sigma=2.0)
+    assert r["state"] == "normal"
+    assert r["contrarian"] is None
+
+
+def test_stretch_single_available_measure_can_fire():
+    # no VWAP (e.g. session just opened) → RSI alone decides
+    r = classify_stretch(close=100, rsi=RSI_OVERBOUGHT + 5, vwap=None, vwap_sigma=None)
+    assert r["state"] == "extended_up"
+    assert r["contrarian"] == "bearish"
+
+
+def test_stretch_na_when_nothing_available():
+    r = classify_stretch(close=100, rsi=None, vwap=None, vwap_sigma=None)
+    assert r["state"] == "n/a"
+    assert r["contrarian"] is None
+
+
+# --- swing-based cvd_divergence ------------------------------------------------
+
+def _zigzag_candles(closes, taker_buys, vol=10):
+    return [fcandle(i, c, vol, tb) for i, (c, tb) in enumerate(zip(closes, taker_buys))]
+
+
+def test_cvd_divergence_swing_bullish_at_lower_low():
+    # price prints a lower swing low (8 → 7) while CVD at those bars rises
+    # (-18 → +6): absorption at the second low → bullish, via the swing path.
+    closes = [10, 9, 8, 9, 10, 8, 7, 8, 9]
+    takers = [2, 2, 2, 8, 8, 8, 8, 5, 5]   # delta -6 x3, +6 x4, 0 x2
+    d = cvd_divergence(_zigzag_candles(closes, takers))
+    assert d["method"] == "swing"
+    assert d["divergence"] == "bullish"
+
+
+def test_cvd_divergence_swing_bearish_at_higher_high():
+    # price prints a higher swing high (9 → 10) while CVD at those bars falls
+    # (+18 → -6): exhaustion into the second high → bearish.
+    closes = [7, 8, 9, 8, 7, 9, 10, 9, 8]
+    takers = [8, 8, 8, 2, 2, 2, 2, 5, 5]   # delta +6 x3, -6 x4, 0 x2
+    d = cvd_divergence(_zigzag_candles(closes, takers))
+    assert d["method"] == "swing"
+    assert d["divergence"] == "bearish"
+
+
+def test_cvd_divergence_swing_none_when_flow_confirms():
+    # same lower low but CVD also makes a lower low → genuine selling, no divergence
+    closes = [10, 9, 8, 9, 10, 8, 7, 8, 9]
+    takers = [2] * 9                        # delta -6 every bar
+    d = cvd_divergence(_zigzag_candles(closes, takers))
+    assert d["method"] == "swing"
+    assert d["divergence"] == "none"
+
+
+def test_cvd_divergence_falls_back_to_slope_without_swings():
+    # monotone series has no fractal pivots → slope path (legacy behavior)
+    candles = [fcandle(i, 100 + i, 10, 2) for i in range(6)]
+    d = cvd_divergence(candles)
+    assert d["method"] == "slope"
+    assert d["divergence"] == "bearish"
+
+
+# --- percentile-gated funding / long-short extremes ---------------------------
+
+def test_classify_funding_percentile_gate_fires_above_floor():
+    r = classify_funding(FUNDING_MIN_EXTREME_APR + 5, percentile=95)
+    assert r["reading"] == "extreme_long_crowding"
+    assert r["contrarian"] == "bearish"
+
+
+def test_classify_funding_percentile_gate_respects_floor():
+    # 95th percentile of a quiet regime is not an extreme
+    r = classify_funding(FUNDING_MIN_EXTREME_APR - 10, percentile=95)
+    assert r["reading"] == "neutral"
+
+
+def test_classify_funding_percentile_gate_short_side():
+    r = classify_funding(-(FUNDING_MIN_EXTREME_APR + 5), percentile=5)
+    assert r["reading"] == "extreme_short_crowding"
+    assert r["contrarian"] == "bullish"
+
+
+def test_classify_long_short_percentile_gate_fires_above_floor():
+    r = classify_long_short(LS_PCTL_FLOOR_LONG + 0.5, percentile=95)
+    assert r["reading"] == "extreme_long_crowding"
+    assert r["contrarian"] == "bearish"
+
+
+def test_classify_long_short_percentile_gate_respects_floor():
+    r = classify_long_short(LS_PCTL_FLOOR_LONG - 0.3, percentile=95)
+    assert r["reading"] == "neutral"
+
+
+def test_classify_long_short_percentile_gate_short_side():
+    r = classify_long_short(LS_PCTL_FLOOR_SHORT - 0.1, percentile=5)
+    assert r["reading"] == "extreme_short_crowding"
+    assert r["contrarian"] == "bullish"
+
+
+# --- cluster-weighted confluence ------------------------------------------------
+
+TREND_FLOW_CLUSTERS = {"regime": "trend", "ema_stack": "trend", "vwap": "trend",
+                       "cvd": "flow", "taker": "flow", "oi_quadrant": "positioning"}
+
+
+def test_confluence_trend_cluster_alone_cannot_align():
+    # every price-path read agrees — the exact top/bottom signature — but they
+    # count as ONE dimension, so the verdict stays leaning, not aligned.
+    r = classify_confluence(
+        {"regime": "bearish", "ema_stack": "bearish", "vwap": "bearish"},
+        clusters=TREND_FLOW_CLUSTERS)
+    assert r["verdict"] == "leaning"
+    assert r["agreeing_clusters"] == 1
+
+
+def test_confluence_aligned_needs_independent_dimensions():
+    r = classify_confluence(
+        {"regime": "bullish", "ema_stack": "bullish", "cvd": "bullish",
+         "oi_quadrant": "bullish"},
+        clusters=TREND_FLOW_CLUSTERS)
+    assert r["verdict"] == "aligned"
+    assert r["agreeing_clusters"] == 3          # trend + flow + positioning
+
+
+def test_confluence_aligned_extended_when_stretched():
+    r = classify_confluence(
+        {"regime": "bullish", "ema_stack": "bullish", "cvd": "bullish",
+         "oi_quadrant": "bullish", "stretch": "bearish"},
+        clusters=TREND_FLOW_CLUSTERS, extension=("stretch",))
+    assert r["verdict"] == "aligned_extended"
+    assert r["direction"] == "long"
+    assert "stretch" in r["opposing"]
+    assert "pullback" in r["note"]
+
+
+def test_confluence_leaning_extended_when_stretched():
+    r = classify_confluence(
+        {"regime": "bullish", "ema_stack": "bullish", "stretch": "bearish"},
+        clusters=TREND_FLOW_CLUSTERS, extension=("stretch",))
+    assert r["verdict"] == "leaning_extended"
+
+
+def test_confluence_hard_opposition_still_blocks_alignment():
+    # a genuine contrarian read (not stretch) opposing → no aligned verdict
+    r = classify_confluence(
+        {"regime": "bullish", "ema_stack": "bullish", "cvd": "bullish",
+         "oi_quadrant": "bullish", "funding_extreme": "bearish"},
+        clusters=TREND_FLOW_CLUSTERS, extension=("stretch",))
+    assert r["verdict"] != "aligned"
+    assert "funding_extreme" in r["opposing"]
+
+
+def test_confluence_legacy_signature_unchanged():
+    # no clusters/extension → raw-count behavior (backward compatible)
+    r = classify_confluence({"regime": "bullish", "cvd": "bullish", "taker": "bullish"})
+    assert r["verdict"] == "aligned"
+    assert r["agreeing_clusters"] == 3
+
+
+# --- flow-ladder-aware pattern confirmation --------------------------------------
+
+def test_pattern_confirmation_reversal_watch_on_flipping_tape():
+    # bullish hammer at a bottom: window flow disagrees (it always does at a
+    # reversal) but the live tape is flipping → early-reversal read, not fakeout
+    r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True,
+                                      flow_shape="flipping")
+    assert r["verdict"] == "reversal_watch"
+
+
+def test_pattern_confirmation_fading_tape_softens_conflict():
+    r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True,
+                                      flow_shape="fading")
+    assert r["verdict"] == "mixed"
+
+
+def test_pattern_confirmation_shape_ignored_when_flow_agrees():
+    r = classify_pattern_confirmation("bullish", "rising", 1.2, at_level=True,
+                                      flow_shape="flipping")
+    assert r["verdict"] == "confirmed"
+
+
+def test_pattern_confirmation_no_shape_keeps_conflicting():
+    r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True)
+    assert r["verdict"] == "conflicting"
     assert classify_flow_ladder(10.0, None, 60, 900) is None

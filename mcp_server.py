@@ -13,7 +13,9 @@ Role note for the model: these tools report setup quality — the trader makes t
 final call. Per-signal caveats mean "not alone", never "never": they are sizing
 inputs, not vetoes. When independent signals align (see get_confluence), state
 that as plainly as you would flag a risk; "stand aside" is a positive claim that
-no edge exists right now, not a safe default answer.
+no edge exists right now, not a safe default answer. The one bound on that
+confidence: trend reads agreeing at a stretched extreme is late, not wrong —
+an *_extended verdict means "continuation on a pullback", never "chase here".
 """
 import math
 from datetime import datetime, timezone
@@ -35,6 +37,7 @@ from indicators import (
     CORR_HIGH,
     detect_candle_patterns, classify_pattern_confirmation,
     classify_confluence, classify_flow_ladder,
+    calc_rsi, classify_stretch,
 )
 from store import now_ms
 from formatting import fmt_orderbook, fmt_indicators, fmt_fibs, fmt_futures_context, fmt_market_breadth
@@ -74,6 +77,11 @@ def _equity_volume_caveat(symbol: str, asset_class) -> str:
     return ""
 
 MAX_LIMIT = 1000
+
+# The two mean-reversion OI quadrants read as exhaustion watch (contrarian),
+# not as continuation votes: long liquidation is how capitulation lows print,
+# short covering is how weak highs print.
+OI_EXHAUSTION = {"long_liquidation": "bullish", "short_covering": "bearish"}
 # Ladder of trailing windows for stream-based (trade-level) flow reads. The
 # comparison across rungs is the signal: 1m vs 15m rate → building or fading.
 LIVE_WINDOWS = (("1m", 60), ("5m", 300), ("15m", 900))
@@ -288,7 +296,11 @@ def get_futures_context(symbol: str) -> dict:
     # OI alone has no direction — classify the OI+price quadrant, and demote the
     # raw L/S ratio to an extreme-only contrarian flag (Plan.md Stage 1 #2, #4).
     quad = classify_oi_price(ctx["oi_change_pct_5h"], ctx["price_change_pct_5h"])
-    ls = classify_long_short(ctx["long_short_ratio"])
+    oi_exhaustion = OI_EXHAUSTION.get(quad["quadrant"])
+    ls = classify_long_short(ctx["long_short_ratio"], ctx["long_short_percentile"])
+    if oi_exhaustion:
+        summary += (f"\n  → OI exhaustion watch ({oi_exhaustion}): {quad['label'].lower()} — "
+                    f"{quad['interpretation']}")
 
     return {
         "symbol": symbol,
@@ -306,9 +318,11 @@ def get_futures_context(symbol: str) -> dict:
         "price_change_pct_5h": r(ctx["price_change_pct_5h"], 4),
         "oi_quadrant": quad["quadrant"],
         "oi_quadrant_label": quad["label"],
+        "oi_exhaustion": oi_exhaustion,
         "long_short_ratio": r(ctx["long_short_ratio"], 4),
         "long_pct": r(ctx["long_pct"], 2),
         "short_pct": r(ctx["short_pct"], 2),
+        "long_short_percentile": r(ctx["long_short_percentile"], 1),
         "long_short_reading": ls["reading"],
         "long_short_contrarian": ls["contrarian"],
         "summary": summary,
@@ -479,8 +493,9 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     and a coarse CVD-vs-price divergence flag, plus a spot-vs-perp read: a rally on
     strong perp CVD but weak spot CVD is leverage-led and fragile; spot-led CVD is
     higher-conviction accumulation. Degrades to a single market when one is unlisted.
-    Both legs are Binance-only: kline-based CVD needs the taker-buy field, which
-    only Binance klines carry (Bybit/Coinbase/Hyperliquid candles have no taker split).
+    Kline-based legs are Binance-only (only Binance klines carry the taker-buy
+    split) — but the `live` spot tape is venue-routed (Binance → Bybit spot →
+    Hyperliquid spot), so Binance-unlisted coins still get a true spot flow read.
     Also returns `live`: trade-level flow from the WebSocket tape (true aggressor
     side per print) as a 1m/5m/15m window ladder per market, with a `shape` label
     (accelerating / steady / fading / flipping / quiet) comparing the 1m vs 15m
@@ -571,7 +586,7 @@ def get_cvd(symbol: str, interval: str = "15m", limit: int = 96) -> dict:
     for market in ("perp", "spot"):
         m = _live_flow(f"{market.upper()}:{symbol}")
         if m is not None:
-            m["venue"] = stream_manager.PERP_VENUE if market == "perp" else stream_manager.SPOT_VENUE
+            m["venue"] = stream_manager.PERP_VENUE if market == "perp" else stream_manager.spot_venue(symbol)
         live[market] = m
 
     def live_line():
@@ -612,12 +627,20 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
     interval: candle interval (default 1h). limit: candles for context (default 192).
 
     Detects: hammer, shooting_star, doji, marubozu, bullish/bearish_engulfing, inside_bar.
-    Returns each with a verdict (confirmed / weak / mixed / conflicting / unconfirmed / neutral)
-    plus the CVD/taker/level context. The latest candle may be in progress — patterns confirm on
-    close. Pair with get_regime (don't take counter-trend patterns in a strong trend).
+    Returns each with a verdict (confirmed / reversal_watch / weak / mixed / conflicting /
+    unconfirmed / neutral) plus the CVD/taker/level context. The latest candle may be in
+    progress — patterns confirm on close. Pair with get_regime (don't take counter-trend
+    patterns in a strong trend).
+
+    For crypto the live WebSocket tape's ladder shape also feeds the verdict: window
+    CVD lags reversals by construction, so a reversal pattern against the prior flow
+    with the live tape FLIPPING scores `reversal_watch` (genuine early-reversal
+    candidate, reduced size, confirm on close) instead of auto-failing as
+    'conflicting'. First call on a symbol subscribes the tape (shape warms up in ~15m).
 
     A `confirmed` verdict is the green light this tool exists to produce — report it
-    as actionable confirmation, not as one more thing to hedge.
+    as actionable confirmation, not as one more thing to hedge. `reversal_watch` is a
+    real early-reversal read, not a hedge.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
@@ -634,6 +657,23 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
     taker = calc_taker_ratio(candles)
     close = float(candles[-1][4])
 
+    # Live tape shape (crypto): the ladder's flipping/fading states can lead a
+    # reversal, which the lagging window CVD by construction cannot. Prefer the
+    # perp tape's shape; fall back to spot.
+    live = None
+    flow_shape = None
+    if router.resolve_asset_class(symbol, asset_class) == "crypto":
+        stream_manager.ensure_subscribed_crypto(symbol)
+        for market in ("PERP", "SPOT"):
+            m = _live_flow(f"{market}:{symbol}")
+            if m is None:
+                continue
+            if live is None:
+                live = m
+            if m["shape"] is not None:
+                live, flow_shape = m, m["shape"]
+                break
+
     # at_level: latest close near a volume-profile node / value-area edge (within 0.3%).
     at_level = False
     level_note = "no profile"
@@ -647,14 +687,16 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
 
     enriched = []
     for p in patterns:
-        conf = classify_pattern_confirmation(p["direction"], cvd_trend, taker, at_level)
+        conf = classify_pattern_confirmation(p["direction"], cvd_trend, taker, at_level,
+                                             flow_shape=flow_shape)
         enriched.append({**p, "verdict": conf["verdict"], "note": conf["note"]})
 
     taker_str = f"{taker:.2f}x" if taker is not None else "n/a"
+    tape_str = f", live tape {flow_shape}" if flow_shape else ""
     if enriched:
         lines = [f"{symbol} {interval} patterns (latest bar; confirms on close):"]
         lines += [f"  {p['pattern']} ({p['direction']}) → {p['verdict']}: {p['note']}" for p in enriched]
-        lines.append(f"  context: CVD {cvd_trend}, taker {taker_str}, {level_note}")
+        lines.append(f"  context: CVD {cvd_trend}, taker {taker_str}, {level_note}{tape_str}")
     else:
         lines = [f"{symbol} {interval}: no candlestick pattern on the latest bar."]
 
@@ -666,6 +708,8 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
         "cvd_divergence": div["divergence"],
         "taker_ratio": None if taker is None else round(taker, 4),
         "at_level": at_level,
+        "flow_shape": flow_shape,
+        "live": live,
         "current_close": close,
         "summary": "\n".join(lines),
     }
@@ -801,17 +845,26 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
     """Signal-alignment scorecard — the explicit counterweight to per-tool caveats.
 
     Every tool in this stack says "not alone"; this one answers "so what happens
-    when they agree?". It collects the stack's independent directional reads —
-    regime (ADX/DI/200-EMA), 20/50/200 EMA stack, CVD trend, taker ratio, VWAP
-    side, OI+price quadrant, funding & long/short contrarian extremes (crypto
-    only) — and returns one verdict:
+    when they agree?". It collects the stack's directional reads — regime
+    (ADX/DI/200-EMA), 20/50/200 EMA stack, CVD trend, taker ratio (last 20 bars),
+    VWAP side, stretch (RSI + VWAP σ-distance), and for crypto the OI+price
+    quadrant, OI exhaustion watch, and funding & long/short contrarian extremes
+    (absolute OR percentile-vs-own-history) — and scores them by independent
+    DIMENSION, not raw count: the price-path reads (regime/EMA-stack/VWAP) share
+    one 'trend' cluster and the flow reads (CVD/taker) another, so a pure
+    trend-following sweep cannot reach 'aligned' by itself. Verdicts:
 
-      aligned   — >=3 reads agree, none oppose: the methodology's GREEN LIGHT.
-                  Report it as an actionable window (direction + which reads
-                  agree); do not re-hedge each component.
-      leaning   — clear majority: reduced-size setup if levels cooperate.
-      mixed     — genuine disagreement: no edge (here standing aside IS the signal).
-      no_signal — everything neutral: nothing loaded either way.
+      aligned          — >=3 independent dimensions agree, none oppose: the
+                         methodology's GREEN LIGHT. Report it as an actionable
+                         window; do not re-hedge each component.
+      aligned_extended — same agreement but price is stretched against the
+                         direction (RSI/VWAP-σ extreme): the setup is real but
+                         LATE — continuation entry on a pullback, never a chase.
+      leaning          — clear dimension majority: reduced-size setup if levels
+                         cooperate. leaning_extended — same, wait for pullback.
+      mixed            — genuine disagreement: no edge (here standing aside IS
+                         the signal).
+      no_signal        — everything neutral: nothing loaded either way.
 
     symbol:   pair like 'BTCUSDT' or a stock/ETF like 'AAPL' (equities skip the
               CVD/taker/derivatives votes and score on the remaining reads).
@@ -819,7 +872,8 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
               timeframe actually being traded).
     limit:    candles to fetch (default 300 so the 200-EMA converges).
 
-    Also returns squeeze_on and ATR as sizing/timing context (not votes).
+    Also returns the stretch read (state, RSI, VWAP σ-distance), squeeze_on and
+    ATR as sizing/timing context.
     """
     symbol = symbol.upper()
     limit = _clamp_limit(limit)
@@ -853,17 +907,25 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
     _, cvd_trend = calc_cvd(candles)
     cvd_vote = {"rising": "bullish", "falling": "bearish", "flat": "neutral"}.get(cvd_trend)
 
-    taker = calc_taker_ratio(candles)
+    # Recent-window taker ratio: the full fetched window (~300 bars) is a trend
+    # summary that mechanically agrees with the move at its extreme.
+    taker = calc_taker_ratio(candles, n=20)
     taker_vote = None if taker is None else \
         "bullish" if taker > 1.05 else "bearish" if taker < 0.95 else "neutral"
 
     session_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-    s_vwap, _, _ = calc_vwap(candles, session_start_ts=session_start)
+    s_vwap, s_sigma, _ = calc_vwap(candles, session_start_ts=session_start)
     if s_vwap is None:
         vwap_vote = None
     else:
         dist = (close - s_vwap) / s_vwap * 100
         vwap_vote = "neutral" if abs(dist) < 0.1 else "bullish" if dist > 0 else "bearish"
+
+    # Stretch/exhaustion — the counterweight to the trend cluster. Votes contrarian
+    # at extremes and converts an aligned-but-late verdict into *_extended.
+    rsi = calc_rsi(closes)
+    stretch = classify_stretch(close, rsi, s_vwap, s_sigma)
+    stretch_vote = None if stretch["state"] == "n/a" else (stretch["contrarian"] or "neutral")
 
     sq = detect_squeeze(candles)
     squeeze_on = None if sq is None else sq["squeeze_on"]
@@ -874,27 +936,48 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
         "cvd": cvd_vote,
         "taker": taker_vote,
         "vwap": vwap_vote,
+        "stretch": stretch_vote,
     }
 
-    # Derivatives positioning reads (crypto only): OI quadrant + contrarian extremes.
+    # Derivatives positioning reads (crypto only): OI quadrant + exhaustion watch
+    # + contrarian extremes (percentile-gated vs their own history).
     if is_crypto:
         ctx = services.compute_futures_context(symbol)
         quad = classify_oi_price(ctx["oi_change_pct_5h"], ctx["price_change_pct_5h"])["quadrant"]
         votes["oi_quadrant"] = {"long_buildup": "bullish", "short_buildup": "bearish"}.get(quad, "neutral")
-        funding_contra = classify_funding(ctx["funding_apr"])["contrarian"]
+        votes["oi_exhaustion"] = OI_EXHAUSTION.get(quad, "neutral")
+        funding_contra = classify_funding(ctx["funding_apr"], ctx["funding_percentile"])["contrarian"]
         votes["funding_extreme"] = funding_contra or "neutral"
-        ls_contra = classify_long_short(ctx["long_short_ratio"])["contrarian"]
+        ls_contra = classify_long_short(ctx["long_short_ratio"],
+                                        ctx["long_short_percentile"])["contrarian"]
         votes["long_short_extreme"] = ls_contra or "neutral"
 
-    conf = classify_confluence(votes)
+    # The price-path reads all move with the same recent candles — they share one
+    # cluster and count once. Flow reads share another. Contrarian/positioning
+    # reads stand alone, so alignment needs genuinely independent agreement.
+    clusters = {
+        "regime": "trend", "ema_stack": "trend", "vwap": "trend",
+        "cvd": "flow", "taker": "flow",
+        "oi_quadrant": "positioning",
+    }
+    conf = classify_confluence(votes, clusters=clusters, extension=("stretch",))
     atr = calc_atr(candles)
 
     counted = {k: v for k, v in votes.items() if v is not None}
     vote_str = ", ".join(f"{k}={v}" for k, v in counted.items())
     squeeze_note = " | squeeze ON (expansion loading)" if squeeze_on else ""
+    stretch_bits = []
+    if stretch["rsi"] is not None:
+        stretch_bits.append(f"RSI {stretch['rsi']:.0f}")
+    if stretch["vwap_sigmas"] is not None:
+        stretch_bits.append(f"{stretch['vwap_sigmas']:+.1f}σ from VWAP")
+    stretch_note = f" | stretch: {stretch['state']} ({', '.join(stretch_bits)})" if stretch_bits else ""
     summary = (f"{symbol} {interval} confluence: {conf['verdict'].upper()}"
                f"{' (' + conf['direction'] + ')' if conf['direction'] else ''}"
-               f"{squeeze_note}\n  votes: {vote_str}\n  → {conf['note']}")
+               f"{squeeze_note}{stretch_note}\n  votes: {vote_str}\n  → {conf['note']}")
+
+    def r(x, ndigits):
+        return None if x is None else round(x, ndigits)
 
     return {
         "symbol": symbol,
@@ -904,7 +987,10 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
         "agreeing": conf["agreeing"],
         "opposing": conf["opposing"],
         "neutral": conf["neutral"],
+        "agreeing_clusters": conf["agreeing_clusters"],
         "votes": votes,
+        "stretch": {"state": stretch["state"], "rsi": r(stretch["rsi"], 1),
+                    "vwap_sigmas": r(stretch["vwap_sigmas"], 2)},
         "regime": reg["regime"],
         "conviction": reg["conviction"],
         "squeeze_on": squeeze_on,

@@ -33,6 +33,7 @@ def compute_futures_context(symbol: str) -> dict:
         "long_short_ratio": None,
         "long_pct": None,
         "short_pct": None,
+        "long_short_percentile": None,
     }
 
     try:
@@ -55,7 +56,8 @@ def compute_futures_context(symbol: str) -> dict:
             ctx["funding_apr"] = indicators.annualize_funding(ctx["funding_rate_pct"] / 100, interval_h)
             apr_hist = [indicators.annualize_funding(float(h["fundingRate"]), interval_h) for h in hist]
             ctx["funding_percentile"] = indicators.percentile_rank(ctx["funding_apr"], apr_hist)
-            ctx["funding_reading"] = indicators.classify_funding(ctx["funding_apr"])["reading"]
+            ctx["funding_reading"] = indicators.classify_funding(
+                ctx["funding_apr"], ctx["funding_percentile"])["reading"]
     except Exception:
         pass
 
@@ -78,13 +80,19 @@ def compute_futures_context(symbol: str) -> dict:
     except Exception:
         pass
 
+    # L/S: fetch ~4 days of hourly history so the latest ratio can be ranked
+    # against its own recent range (absolute extremes are rarely reached).
     try:
-        data = binance.fetch_long_short_ratio(symbol, period="1h", limit=1)
+        data = binance.fetch_long_short_ratio(symbol, period="1h", limit=100)
         if data:
-            ls = data[0]
+            ls = data[-1]  # rows are oldest-first
             ctx["long_short_ratio"] = float(ls["longShortRatio"])
             ctx["long_pct"] = float(ls["longAccount"]) * 100
             ctx["short_pct"] = float(ls["shortAccount"]) * 100
+            hist = [float(h["longShortRatio"]) for h in data]
+            if len(hist) >= 10:
+                ctx["long_short_percentile"] = indicators.percentile_rank(
+                    ctx["long_short_ratio"], hist)
     except Exception:
         pass
 

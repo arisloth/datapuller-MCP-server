@@ -116,7 +116,7 @@ def fmt_indicators(values):
         "Indicators:",
         cvd_line,
         taker_line,
-        f"  Volume ratio (current / 20-bar avg): {vol_ratio:.2f}x",
+        f"  Volume ratio (last closed bar / 20-bar avg): {vol_ratio:.2f}x",
         f"  ADX(14): {adx:.1f} [{adx_label}] | +DI: {pdi:.1f} | -DI: {ndi:.1f}{bias}",
         squeeze_line,
         pattern_line,
@@ -188,7 +188,7 @@ def fmt_futures_context(ctx):
             if pct is not None:
                 extra += f", {pct:.0f}th pct"
             extra += ")"
-            note = classify_funding(apr)["note"]
+            note = classify_funding(apr, pct)["note"]
         else:
             extra, note = "", ""
         lines.append(f"  Funding rate:  {rate:+.4f}%/interval{extra}  →  {direction}")
@@ -222,9 +222,11 @@ def fmt_futures_context(ctx):
     # --- global long/short account ratio (demoted: extreme-flag only) ---
     if ctx["long_short_ratio"] is not None:
         ratio = ctx["long_short_ratio"]
-        ls = classify_long_short(ratio)
+        ls_pct = ctx.get("long_short_percentile")
+        ls = classify_long_short(ratio, ls_pct)
+        pct_s = f", {ls_pct:.0f}th pct vs 100h" if ls_pct is not None else ""
         lines.append(
-            f"  L/S accounts:  {ratio:.3f}  (Long {ctx['long_pct']:.1f}% / Short {ctx['short_pct']:.1f}%) "
+            f"  L/S accounts:  {ratio:.3f}  (Long {ctx['long_pct']:.1f}% / Short {ctx['short_pct']:.1f}%{pct_s}) "
             f"— {ls['note']}"
         )
     else:
