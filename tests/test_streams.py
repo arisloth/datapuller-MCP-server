@@ -183,6 +183,7 @@ def fake_manager(monkeypatch):
     monkeypatch.setattr(manager, "_clients", {})
     monkeypatch.setattr(manager, "_budget_crypto", manager.SubscriptionBudget(budget=2))
     monkeypatch.setattr(manager, "_spot_route", {})
+    monkeypatch.setattr(manager, "_spot_route_failed", {})
     # no network in tests: everything routes to Binance unless a test re-patches
     monkeypatch.setattr(manager, "_resolve_spot_route",
                         lambda s: manager._spot_route.setdefault(s, ("binance", s)))
@@ -241,6 +242,38 @@ def test_manager_routes_spot_by_venue(fake_manager, monkeypatch):
     # budget=2 → BTCUSDT evicted; the sweep reaches every spot client
     for c in _FakeClient.instances:
         assert c.unsubscribed == ["BTCUSDT"]
+
+
+def test_spot_route_failure_not_cached_and_retried(monkeypatch):
+    # all probes down (startup outage): default returned, NOT cached as a route;
+    # within the TTL no re-probe; past the TTL with connectivity back, the real
+    # route is resolved and cached
+    monkeypatch.setattr(manager, "_spot_route", {})
+    monkeypatch.setattr(manager, "_spot_route_failed", {})
+    calls = {"n": 0}
+
+    def boom(sym):
+        calls["n"] += 1
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(manager.binance_rest, "fetch_24h", boom)
+    monkeypatch.setattr(manager.bybit_rest, "fetch_24h_spot", boom)
+    monkeypatch.setattr(manager.hyperliquid_rest, "spot_pair_name", boom)
+
+    assert manager._resolve_spot_route("BTCUSDT") == ("binance", "BTCUSDT")
+    assert "BTCUSDT" not in manager._spot_route      # failure is not a route
+    assert calls["n"] == 3
+
+    # inside the retry window: default again, no fresh probes
+    assert manager._resolve_spot_route("BTCUSDT") == ("binance", "BTCUSDT")
+    assert calls["n"] == 3
+
+    # window elapsed and connectivity restored → re-probe, cache the success
+    manager._spot_route_failed["BTCUSDT"] -= manager.ROUTE_RETRY_S + 1
+    monkeypatch.setattr(manager.binance_rest, "fetch_24h", lambda s: {"lastPrice": "1"})
+    assert manager._resolve_spot_route("BTCUSDT") == ("binance", "BTCUSDT")
+    assert manager._spot_route["BTCUSDT"] == ("binance", "BTCUSDT")
+    assert "BTCUSDT" not in manager._spot_route_failed
 
 
 # --- get_cvd live wiring ---------------------------------------------------------

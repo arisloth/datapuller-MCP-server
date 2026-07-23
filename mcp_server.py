@@ -36,7 +36,7 @@ from indicators import (
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     CORR_HIGH,
     detect_candle_patterns, classify_pattern_confirmation,
-    classify_confluence, classify_flow_ladder,
+    classify_confluence, classify_flow_ladder, CONFLUENCE_CLUSTERS,
     calc_rsi, classify_stretch,
 )
 from store import now_ms
@@ -82,6 +82,9 @@ MAX_LIMIT = 1000
 # not as continuation votes: long liquidation is how capitulation lows print,
 # short covering is how weak highs print.
 OI_EXHAUSTION = {"long_liquidation": "bullish", "short_covering": "bearish"}
+# Session-VWAP sigma needs at least this many session bars before the stretch
+# read trusts σ-distance (fewer → RSI-only).
+STRETCH_MIN_VWAP_BARS = 10
 # Ladder of trailing windows for stream-based (trade-level) flow reads. The
 # comparison across rungs is the signal: 1m vs 15m rate → building or fading.
 LIVE_WINDOWS = (("1m", 60), ("5m", 300), ("15m", 900))
@@ -662,6 +665,7 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
     # perp tape's shape; fall back to spot.
     live = None
     flow_shape = None
+    live_cvd_1m = None
     if router.resolve_asset_class(symbol, asset_class) == "crypto":
         stream_manager.ensure_subscribed_crypto(symbol)
         for market in ("PERP", "SPOT"):
@@ -672,6 +676,8 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
                 live = m
             if m["shape"] is not None:
                 live, flow_shape = m, m["shape"]
+                rung_1m = m["windows"].get("1m")
+                live_cvd_1m = rung_1m["cvd"] if rung_1m else None
                 break
 
     # at_level: latest close near a volume-profile node / value-area edge (within 0.3%).
@@ -688,7 +694,7 @@ def get_patterns(symbol: str, interval: str = "1h", limit: int = 192, asset_clas
     enriched = []
     for p in patterns:
         conf = classify_pattern_confirmation(p["direction"], cvd_trend, taker, at_level,
-                                             flow_shape=flow_shape)
+                                             flow_shape=flow_shape, live_cvd_1m=live_cvd_1m)
         enriched.append({**p, "verdict": conf["verdict"], "note": conf["note"]})
 
     taker_str = f"{taker:.2f}x" if taker is not None else "n/a"
@@ -914,7 +920,7 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
         "bullish" if taker > 1.05 else "bearish" if taker < 0.95 else "neutral"
 
     session_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-    s_vwap, s_sigma, _ = calc_vwap(candles, session_start_ts=session_start)
+    s_vwap, s_sigma, s_bars = calc_vwap(candles, session_start_ts=session_start)
     if s_vwap is None:
         vwap_vote = None
     else:
@@ -922,9 +928,13 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
         vwap_vote = "neutral" if abs(dist) < 0.1 else "bullish" if dist > 0 else "bearish"
 
     # Stretch/exhaustion — the counterweight to the trend cluster. Votes contrarian
-    # at extremes and converts an aligned-but-late verdict into *_extended.
+    # at extremes and converts an aligned-but-late verdict into *_extended. The
+    # σ-distance leg needs a settled sigma: right after the UTC session open it is
+    # computed from 1-3 bars and swings ±5σ on noise, so it degrades to RSI-only
+    # until enough session bars exist.
     rsi = calc_rsi(closes)
-    stretch = classify_stretch(close, rsi, s_vwap, s_sigma)
+    stretch = classify_stretch(close, rsi, s_vwap,
+                               s_sigma if s_bars >= STRETCH_MIN_VWAP_BARS else None)
     stretch_vote = None if stretch["state"] == "n/a" else (stretch["contrarian"] or "neutral")
 
     sq = detect_squeeze(candles)
@@ -952,15 +962,9 @@ def get_confluence(symbol: str, interval: str = "1h", limit: int = 300, asset_cl
                                         ctx["long_short_percentile"])["contrarian"]
         votes["long_short_extreme"] = ls_contra or "neutral"
 
-    # The price-path reads all move with the same recent candles — they share one
-    # cluster and count once. Flow reads share another. Contrarian/positioning
-    # reads stand alone, so alignment needs genuinely independent agreement.
-    clusters = {
-        "regime": "trend", "ema_stack": "trend", "vwap": "trend",
-        "cvd": "flow", "taker": "flow",
-        "oi_quadrant": "positioning",
-    }
-    conf = classify_confluence(votes, clusters=clusters, extension=("stretch",))
+    # Correlated reads count once per dimension (trend / flow / positioning —
+    # see CONFLUENCE_CLUSTERS), so alignment needs genuinely independent agreement.
+    conf = classify_confluence(votes, clusters=CONFLUENCE_CLUSTERS, extension=("stretch",))
     atr = calc_atr(candles)
 
     counted = {k: v for k, v in votes.items() if v is not None}

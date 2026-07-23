@@ -622,6 +622,12 @@ def cvd_divergence(candles) -> dict:
     else:
         price_trend = "flat"
 
+    slope_divergence = "none"
+    if price_trend == "rising" and cvd_trend == "falling":
+        slope_divergence = "bearish"
+    elif price_trend == "falling" and cvd_trend == "rising":
+        slope_divergence = "bullish"
+
     high_idxs, low_idxs = find_swing_points(closes)
     if len(high_idxs) >= 2 or len(low_idxs) >= 2:
         # Swing path: check both sides, keep whichever divergence is more recent.
@@ -634,17 +640,22 @@ def cvd_divergence(candles) -> dict:
             a, b = high_idxs[-2], high_idxs[-1]
             if closes[b] > closes[a] and series[b] < series[a]:
                 candidates.append((b, "bearish"))
-        divergence = max(candidates)[1] if candidates else "none"
-        return {"price_trend": price_trend, "cvd_trend": cvd_trend,
-                "divergence": divergence, "method": "swing"}
+        if candidates:
+            return {"price_trend": price_trend, "cvd_trend": cvd_trend,
+                    "divergence": max(candidates)[1], "method": "swing"}
+        # A swing "none" is authoritative only for the side(s) with two pivots
+        # (bullish needs two lows, bearish two highs). If the slope read flags a
+        # divergence on a side the swing path couldn't test, let it through
+        # instead of masking it with a one-eyed "none".
+        side_testable = {"none": True,
+                         "bullish": len(low_idxs) >= 2,
+                         "bearish": len(high_idxs) >= 2}
+        if side_testable[slope_divergence]:
+            return {"price_trend": price_trend, "cvd_trend": cvd_trend,
+                    "divergence": "none", "method": "swing"}
 
-    divergence = "none"
-    if price_trend == "rising" and cvd_trend == "falling":
-        divergence = "bearish"
-    elif price_trend == "falling" and cvd_trend == "rising":
-        divergence = "bullish"
     return {"price_trend": price_trend, "cvd_trend": cvd_trend,
-            "divergence": divergence, "method": "slope"}
+            "divergence": slope_divergence, "method": "slope"}
 
 
 def calc_bollinger(closes, period: int = 20, mult: float = 2.0):
@@ -909,16 +920,19 @@ def detect_candle_patterns(candles) -> list:
 
 
 def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level,
-                                  flow_shape: str | None = None) -> dict:
+                                  flow_shape: str | None = None,
+                                  live_cvd_1m: float | None = None) -> dict:
     """Whether a directional candle pattern is CONFIRMED by order flow + location.
     Patterns are confirmation, never standalone triggers.
 
     `flow_shape` (optional) is the live tape's ladder state (see
     classify_flow_ladder). Window CVD/taker lag reversals by construction, so a
     reversal pattern against the prior flow would always score 'conflicting' —
-    the live shape breaks that: 'flipping' (tape running against the prior flow)
-    turns pure conflict into `reversal_watch`, and 'fading' (prior push going
-    stale) softens it to 'mixed'."""
+    the live shape breaks that: 'flipping' with the short rung's flow
+    (`live_cvd_1m`) signed TOWARD the pattern turns pure conflict into
+    `reversal_watch`, and 'fading' (prior push going stale) softens it to
+    'mixed'. 'flipping' alone is direction-agnostic (1m sign opposite 15m sign),
+    so without a matching `live_cvd_1m` the conflict stands."""
     if direction == "neutral":
         return {"verdict": "neutral",
                 "note": "indecision / compression — becomes tradable on the breakout side once CVD/taker pick a direction."}
@@ -942,10 +956,16 @@ def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level,
                 "note": f"order flow is mixed on the {direction} pattern (CVD and taker disagree) — wait for them to realign before acting."}
     if conflict:
         if flow_shape == "flipping":
-            return {"verdict": "reversal_watch",
-                    "note": f"{direction} pattern against the prior flow, but the live tape is FLIPPING "
-                            f"the same way — early-reversal candidate, not a fakeout read. Confirm on "
-                            f"close; if it holds, this is a genuine counter-trend entry at reduced size."}
+            toward = (live_cvd_1m is not None and
+                      (live_cvd_1m > 0 if direction == "bullish" else live_cvd_1m < 0))
+            if toward:
+                return {"verdict": "reversal_watch",
+                        "note": f"{direction} pattern against the prior flow, but the live tape is "
+                                f"FLIPPING toward it — early-reversal candidate, not a fakeout read; "
+                                f"confirms on close."}
+            return {"verdict": "conflicting",
+                    "note": f"order flow disagrees with the {direction} pattern and the live tape is "
+                            f"flipping AGAINST it — fakeout risk; the opposite-side read may be the real signal."}
         if flow_shape == "fading":
             return {"verdict": "mixed",
                     "note": f"order flow disagrees with the {direction} pattern but the live tape shows the "
@@ -954,7 +974,7 @@ def classify_pattern_confirmation(direction, cvd_trend, taker_ratio, at_level,
                 "note": f"order flow disagrees with the {direction} pattern — fakeout risk; the opposite-side read may be the real signal."}
     if agree and at_level:
         return {"verdict": "confirmed",
-                "note": f"{direction} pattern at a level with order flow agreeing — full confirmation. This is the setup the framework exists to catch: act per plan, ATR-sized."}
+                "note": f"{direction} pattern at a level with order flow agreeing — full confirmation. This is the setup the framework exists to catch."}
     if agree:
         return {"verdict": "weak",
                 "note": f"{direction} pattern with agreeing order flow but mid-range — tradable at reduced size if the regime agrees; upgrades to confirmed at a POC/VA edge."}
@@ -998,6 +1018,19 @@ def classify_flow_ladder(cvd_short, cvd_long, short_s: float, long_s: float) -> 
 # voice. When independent reads agree, say so as plainly as a risk flag.
 
 CONFLUENCE_ALIGNED_MIN = 3  # unopposed agreeing CLUSTERS needed for a full 'aligned' verdict
+
+# Canonical vote → dimension map (Plan.md's confluence discipline: structure /
+# order flow / positioning). Price-path reads share 'trend'; CVD/taker share
+# 'flow'; ALL the derivatives-positioning reads share 'positioning' — funding
+# and L/S extremes are two thermometers on the same crowding, and the OI votes
+# come from the same OI+price quadrant. Stretch stays its own dimension
+# (extension, the designated `extension` vote).
+CONFLUENCE_CLUSTERS = {
+    "regime": "trend", "ema_stack": "trend", "vwap": "trend",
+    "cvd": "flow", "taker": "flow",
+    "oi_quadrant": "positioning", "oi_exhaustion": "positioning",
+    "funding_extreme": "positioning", "long_short_extreme": "positioning",
+}
 
 
 def _cluster_count(names, clusters):
@@ -1062,13 +1095,14 @@ def classify_confluence(votes: dict, clusters: dict | None = None,
     ext_note = ""
     if ext_opposing:
         ext_note = (f" ⚠ price is stretched against the {direction} "
-                    f"({', '.join(ext_opposing)}) — continuation entry on a pullback, don't chase.")
+                    f"({', '.join(ext_opposing)}) — a late window, historically resolved by a "
+                    f"pullback more often than by continuation from here.")
 
     if not hard_opposing and agree_c >= CONFLUENCE_ALIGNED_MIN:
         note = (f"{len(agreeing)} reads across {agree_c} independent dimensions agree "
                 f"({direction}: {', '.join(agreeing)}) with none opposing — by this stack's own "
-                f"confluence standard this IS an actionable window. Treat remaining caveats as "
-                f"sizing inputs, not vetoes.")
+                f"confluence standard this IS an actionable window; remaining caveats are "
+                f"sizing context.")
         verdict = "aligned"
     elif not hard_opposing or agree_c >= 2 * max(hard_oppose_c, 1):
         note = (f"majority of reads lean {direction} ({agree_c} vs {hard_oppose_c} dimensions"

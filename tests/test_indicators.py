@@ -19,7 +19,7 @@ from indicators import (  # noqa: E402
     classify_funding, classify_basis,
     pct_returns, correlation, beta, classify_correlation, classify_rotation,
     detect_candle_patterns, classify_pattern_confirmation,
-    classify_confluence, classify_flow_ladder,
+    classify_confluence, classify_flow_ladder, CONFLUENCE_CLUSTERS,
     calc_rsi, find_swing_points, classify_stretch,
     LS_EXTREME_LONG, LS_EXTREME_SHORT, FUNDING_EXTREME_APR,
     RSI_OVERBOUGHT, RSI_OVERSOLD, VWAP_SIGMA_EXTREME,
@@ -806,6 +806,19 @@ def test_stretch_na_when_nothing_available():
     assert r["contrarian"] is None
 
 
+def test_stretch_sigma_gate_composition():
+    # right after the UTC session open, sigma comes from a handful of bars —
+    # calc_vwap reports bars_used so the caller can gate the σ leg (get_confluence
+    # passes vwap_sigma=None below STRETCH_MIN_VWAP_BARS); stretch then degrades
+    # to RSI-only instead of firing on a 3-bar sigma
+    candles = [candle(t, 100, 101, 99, 100, 10) for t in range(3)]
+    vwap, sigma, bars = calc_vwap(candles, session_start_ts=0)
+    assert bars == 3
+    r = classify_stretch(close=104, rsi=50.0, vwap=vwap, vwap_sigma=None)
+    assert r["vwap_sigmas"] is None
+    assert r["state"] == "normal"
+
+
 # --- swing-based cvd_divergence ------------------------------------------------
 
 def _zigzag_candles(closes, taker_buys, vol=10):
@@ -847,6 +860,19 @@ def test_cvd_divergence_falls_back_to_slope_without_swings():
     d = cvd_divergence(candles)
     assert d["method"] == "slope"
     assert d["divergence"] == "bearish"
+
+
+def test_cvd_divergence_one_eyed_swing_falls_back_to_slope():
+    # two swing highs but only ONE swing low: the bullish side is untestable on
+    # the swing path, so a price-falling + CVD-rising slope divergence must come
+    # through instead of being masked by a one-eyed swing "none"
+    closes = [20, 22, 24, 21, 19, 20, 21, 17, 15, 14, 13.5, 13.4]
+    highs, lows = find_swing_points(closes)
+    assert len(highs) >= 2 and len(lows) < 2      # fixture sanity
+    takers = [9] * len(closes)                    # delta +8 per bar → CVD rising
+    d = cvd_divergence(_zigzag_candles(closes, takers))
+    assert d["method"] == "slope"
+    assert d["divergence"] == "bullish"
 
 
 # --- percentile-gated funding / long-short extremes ---------------------------
@@ -939,6 +965,28 @@ def test_confluence_hard_opposition_still_blocks_alignment():
     assert "funding_extreme" in r["opposing"]
 
 
+def test_confluence_positioning_votes_share_one_cluster():
+    # the real map: funding, L/S and OI exhaustion are correlated crowding reads
+    # — one 'positioning' dimension, so contrarian-only agreement can't align
+    r = classify_confluence(
+        {"funding_extreme": "bearish", "long_short_extreme": "bearish",
+         "oi_exhaustion": "bearish"},
+        clusters=CONFLUENCE_CLUSTERS, extension=("stretch",))
+    assert r["agreeing_clusters"] == 1
+    assert r["verdict"] != "aligned"
+
+
+def test_confluence_real_map_aligned_needs_three_dimensions():
+    # trend + flow + positioning with the canonical map → aligned; the extra
+    # positioning votes don't inflate the dimension count
+    r = classify_confluence(
+        {"regime": "bearish", "ema_stack": "bearish", "cvd": "bearish",
+         "funding_extreme": "bearish", "long_short_extreme": "bearish"},
+        clusters=CONFLUENCE_CLUSTERS, extension=("stretch",))
+    assert r["verdict"] == "aligned"
+    assert r["agreeing_clusters"] == 3
+
+
 def test_confluence_legacy_signature_unchanged():
     # no clusters/extension → raw-count behavior (backward compatible)
     r = classify_confluence({"regime": "bullish", "cvd": "bullish", "taker": "bullish"})
@@ -950,10 +998,30 @@ def test_confluence_legacy_signature_unchanged():
 
 def test_pattern_confirmation_reversal_watch_on_flipping_tape():
     # bullish hammer at a bottom: window flow disagrees (it always does at a
-    # reversal) but the live tape is flipping → early-reversal read, not fakeout
+    # reversal) but the live 1m tape is flipping TOWARD the pattern (positive
+    # CVD) → early-reversal read, not fakeout
+    r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True,
+                                      flow_shape="flipping", live_cvd_1m=4.2)
+    assert r["verdict"] == "reversal_watch"
+
+
+def test_pattern_confirmation_flipping_against_pattern_stays_conflicting():
+    # 'flipping' is direction-agnostic (1m sign opposite 15m sign): here the 1m
+    # tape is flipping bearish while the pattern is bullish → still a conflict,
+    # not a reversal candidate
+    r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True,
+                                      flow_shape="flipping", live_cvd_1m=-4.2)
+    assert r["verdict"] == "conflicting"
+    r = classify_pattern_confirmation("bearish", "rising", 1.2, at_level=True,
+                                      flow_shape="flipping", live_cvd_1m=4.2)
+    assert r["verdict"] == "conflicting"
+
+
+def test_pattern_confirmation_flipping_without_live_cvd_stays_conflicting():
+    # no 1m rung to sign the flip → cannot claim the tape turned toward the pattern
     r = classify_pattern_confirmation("bullish", "falling", 0.8, at_level=True,
                                       flow_shape="flipping")
-    assert r["verdict"] == "reversal_watch"
+    assert r["verdict"] == "conflicting"
 
 
 def test_pattern_confirmation_fading_tape_softens_conflict():

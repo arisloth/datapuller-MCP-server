@@ -10,12 +10,14 @@ and reports "warming" until trades accumulate in the store).
 Venue choice: PERP tape from Bybit — Binance's futures WS data plane is
 silently filtered on some networks (see streams/bybit.py). SPOT tape is routed
 per symbol: Binance, falling back to Bybit spot, then Hyperliquid spot for
-coins Binance doesn't list (probed once over REST, cached). All spot tapes are
+coins Binance doesn't list (probed over REST; successful routes cached,
+failures retried after ROUTE_RETRY_S). All spot tapes are
 keyed "SPOT:<SYMBOL>" — exactly one venue streams a given symbol, so the
 ladder never double-counts.
 """
 import asyncio
 import threading
+import time
 
 from providers import alpaca as alpaca_rest
 from providers import binance as binance_rest
@@ -27,13 +29,15 @@ from . import alpaca, binance, bybit, hyperliquid
 
 PERP_VENUE = "bybit"
 SPOT_VENUE = "binance"   # default spot venue; per-symbol routing via spot_venue()
+ROUTE_RETRY_S = 300      # re-probe after a failed route resolution this often
 
 _lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _clients: dict[str, object] = {}
 _budget_crypto = SubscriptionBudget()
 _budget_equity = SubscriptionBudget()  # 30 = Alpaca IEX symbol limit
-_spot_route: dict[str, tuple[str, str]] = {}  # symbol -> (venue, venue coin id)
+_spot_route: dict[str, tuple[str, str]] = {}  # symbol -> (venue, coin id); successes only
+_spot_route_failed: dict[str, float] = {}     # symbol -> monotonic ts of last all-probes failure
 
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
@@ -51,12 +55,20 @@ def _submit(coro) -> None:
 
 
 def _resolve_spot_route(symbol: str) -> tuple[str, str]:
-    """Which venue serves `symbol`'s spot tape, probed once over REST and cached:
-    Binance, else Bybit spot, else Hyperliquid spot (whose pair id doubles as the
-    WS subscription coin). Coins listed nowhere default to Binance — the tape
-    just stays empty, same behavior as before routing existed."""
-    if symbol in _spot_route:
-        return _spot_route[symbol]
+    """Which venue serves `symbol`'s spot tape, probed over REST: Binance, else
+    Bybit spot, else Hyperliquid spot (whose pair id doubles as the WS
+    subscription coin). Only SUCCESSFUL probes are cached; when every probe
+    fails (coin listed nowhere, or no connectivity) the Binance default is
+    returned uncached and re-probed after ROUTE_RETRY_S, so a startup outage
+    doesn't pin a dead route for the process lifetime. Accepted limitation: a
+    transient Binance failure while Bybit answers still caches a Bybit route
+    for a Binance-listed coin — the tape works either way."""
+    with _lock:
+        if symbol in _spot_route:
+            return _spot_route[symbol]
+        failed_at = _spot_route_failed.get(symbol)
+        if failed_at is not None and time.monotonic() - failed_at < ROUTE_RETRY_S:
+            return SPOT_VENUE, symbol
 
     def probe_binance():
         binance_rest.fetch_24h(symbol)
@@ -69,21 +81,29 @@ def _resolve_spot_route(symbol: str) -> tuple[str, str]:
     def probe_hyperliquid():
         return "hyperliquid", hyperliquid_rest.spot_pair_name(symbol)
 
+    # Probes are blocking HTTP — run them outside the lock.
     for probe in (probe_binance, probe_bybit, probe_hyperliquid):
         try:
-            _spot_route[symbol] = probe()
+            route = probe()
             break
         except Exception:
             continue
     else:
-        _spot_route[symbol] = ("binance", symbol)
-    return _spot_route[symbol]
+        with _lock:
+            _spot_route_failed[symbol] = time.monotonic()
+        return SPOT_VENUE, symbol
+
+    with _lock:
+        _spot_route[symbol] = route
+        _spot_route_failed.pop(symbol, None)
+    return route
 
 
 def spot_venue(symbol: str) -> str:
     """Venue serving the symbol's spot tape ('binance'/'bybit'/'hyperliquid').
     Resolved by ensure_subscribed_crypto; defaults to 'binance' before that."""
-    return _spot_route.get(symbol.upper(), (SPOT_VENUE, ""))[0]
+    with _lock:
+        return _spot_route.get(symbol.upper(), (SPOT_VENUE, ""))[0]
 
 
 def _spot_client(venue: str):
@@ -102,9 +122,12 @@ def _spot_client(venue: str):
 
 
 def ensure_subscribed_crypto(symbol: str) -> None:
-    """Idempotent, non-blocking: subscribe the perp (Bybit) and spot (routed
-    venue) trade streams for `symbol`, starting the loop and clients on first
-    use. LRU-evicts the oldest symbol past the budget."""
+    """Idempotent: subscribe the perp (Bybit) and spot (routed venue) trade
+    streams for `symbol`, starting the loop and clients on first use.
+    LRU-evicts the oldest symbol past the budget. Subscription submission is
+    fire-and-forget, but the FIRST call for a symbol may block briefly on the
+    spot-route REST probes (Binance-listed symbols short-circuit on the first
+    probe; see _resolve_spot_route)."""
     symbol = symbol.upper()
     venue, coin = _resolve_spot_route(symbol)
     with _lock:
@@ -112,22 +135,27 @@ def ensure_subscribed_crypto(symbol: str) -> None:
         if "perp" not in _clients:
             _clients["perp"] = bybit.BybitTradeStream("PERP")
             started.append(_clients["perp"])
+        perp = _clients["perp"]
         spot, spot_started = _spot_client(venue)
         if spot_started:
             started.append(spot)
+    # _submit re-enters _lock via _ensure_loop — everything below stays outside it.
     for client in started:
         _submit(client.run())
 
     evicted = _budget_crypto.touch(symbol)
-    _submit(_clients["perp"].subscribe(symbol))
+    _submit(perp.subscribe(symbol))
     if venue == "hyperliquid":
         _submit(spot.subscribe(symbol, coin))
     else:
         _submit(spot.subscribe(symbol))
-    for old in evicted:
+    if evicted:
         # the evicted symbol may live on a different spot venue — sweep them all
-        for key, client in list(_clients.items()):
-            if key == "perp" or key.startswith("spot:"):
+        with _lock:
+            sweep = [c for k, c in _clients.items()
+                     if k == "perp" or k.startswith("spot:")]
+        for old in evicted:
+            for client in sweep:
                 _submit(client.unsubscribe(old))
 
 
